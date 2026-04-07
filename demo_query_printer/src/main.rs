@@ -1,20 +1,35 @@
 use common::query::{
-    ComparisionOperator, ComparisionValue, MultiProjectBuilder, MultiSortBuilder, QueryOp,
+    Query, QueryOp, ProjectData, FilterData,
+    CrossData, ScanData, Predicate,
+    ComparisionOperator, ComparisionValue
 };
 
 fn main() {
-    let query = QueryOp::scan("A")
-        .cross(QueryOp::scan("B"))
-        .filter(
-            "a1",
-            ComparisionOperator::EQ,
-            ComparisionValue::Column(String::from("b1")),
-        )
-        .filter("b3", ComparisionOperator::GTE, ComparisionValue::I32(0))
-        // You also have filter multiple
-        .sort_multiple(MultiSortBuilder::new("a2", true).add("b2", false))
-        .project_multiple(MultiProjectBuilder::new("a1", "id").add("b2", "b2"))
-        .build();
+    let query = Query {
+        root: QueryOp::Project(ProjectData {
+            column_name_map: vec![
+                ("o_orderkey".to_string(), "o_orderkey".to_string()),
+                ("c_name".to_string(), "c_name".to_string()),
+            ],
+            underlying: Box::new(QueryOp::Filter(FilterData {
+                predicates: vec![
+                    Predicate {
+                        column_name: "o_custkey".to_string(),
+                        operator: ComparisionOperator::EQ,
+                        value: ComparisionValue::Column("c_custkey".to_string()),
+                    }
+                ],
+                underlying: Box::new(QueryOp::Cross(CrossData {
+                    left: Box::new(QueryOp::Scan(ScanData {
+                        table_id: "orders".to_string(),
+                    })),
+                    right: Box::new(QueryOp::Scan(ScanData {
+                        table_id: "customer".to_string(),
+                    })),
+                })),
+            })),
+        }),
+    };
 
     let query_json = serde_json::to_string_pretty(&query).unwrap();
 
