@@ -4,6 +4,5 @@
 **/*.schema
 **/*.bin
 database/src/main.old.rs
-database/src/scratch.rs
 demo_query_printer/src/b.main.rs.backup
 temp.json
