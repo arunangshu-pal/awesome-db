@@ -21,8 +21,11 @@ use crate::{
     io_setup::{setup_disk_io, setup_monitor_io},
 };
 
+use scratch::ScratchAllocator;      //APal
+
 mod cli;
 mod io_setup;
+mod scratch;                        //APal
 
 #[derive(Clone)]
 struct ColumnMeta {
@@ -90,6 +93,22 @@ impl DiskClient {
         let mut bytes = vec![0u8; (num_blocks as usize) * self.block_size];
         self.reader.read_exact(&mut bytes)?;
         Ok(bytes)
+    }
+
+    fn get_anon_start_block(&mut self) -> Result<u64> {
+        self.writer.write_all(b"get anon-start-block\n")?;
+        self.writer.flush()?;
+        read_u64_line(&mut self.reader)
+    }
+
+    fn put_blocks(&mut self, start_block_id: u64, data: &[u8]) -> Result<()> {
+        let num_blocks = data.len() / self.block_size;
+        self.writer.write_all(
+            format!("put block {start_block_id} {num_blocks}\n").as_bytes()
+        )?;
+        self.writer.write_all(data)?;
+        self.writer.flush()?;
+        Ok(())
     }
 }
 
@@ -899,6 +918,7 @@ fn execute_query_op(
     query_op: &QueryOp,
     ctx: &DbContext,
     disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,                 //APal
 ) -> Result<Box<dyn RowSource>> {
     match query_op {
         QueryOp::Scan(ScanData { table_id }) => {
@@ -906,7 +926,7 @@ fn execute_query_op(
             Ok(Box::new(ScanSource::new(table, disk_client, None)?))
         }
         QueryOp::Filter(filter) => {
-            let child = execute_query_op(&filter.underlying, ctx, disk_client)?;
+            let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch)?;       //APal
             Ok(Box::new(FilterSource::new(filter, child)))
         }
         QueryOp::Project(project) => {
@@ -938,18 +958,18 @@ fn execute_query_op(
                 }
             }
 
-            let child = execute_query_op(&project.underlying, ctx, disk_client)?;
+            let child = execute_query_op(&project.underlying, ctx, disk_client, scratch)?;      //APal
             Ok(Box::new(ProjectSource::new(project, child)?))
         }
         QueryOp::Sort(sort) => {
-            let child = execute_query_op(&sort.underlying, ctx, disk_client)?;
+            let child = execute_query_op(&sort.underlying, ctx, disk_client, scratch)?;         //APal
             let mut result = materialize_source(child)?;
             sort_rows(sort, &mut result.rows, &result.columns)?;
             Ok(Box::new(MaterializedSource::new(result)))
         }
         QueryOp::Cross(cross) => {
-            let left = materialize_source(execute_query_op(&cross.left, ctx, disk_client.clone())?)?;
-            let right = materialize_source(execute_query_op(&cross.right, ctx, disk_client)?)?;
+            let left = materialize_source(execute_query_op(&cross.left, ctx, disk_client.clone(), scratch)?)?;      //APal
+            let right = materialize_source(execute_query_op(&cross.right, ctx, disk_client, scratch)?)?;            //APal
             Ok(Box::new(MaterializedSource::new(execute_cross(left, right))))
         }
     }
@@ -1008,6 +1028,11 @@ fn db_main() -> Result<()> {
         disk_writer,
     )?));
 
+    let anon_start = disk_client.borrow_mut().get_anon_start_block()?;  //APal
+    
+    let block_size = disk_client.borrow().block_size;                   //APal
+    let mut scratch = ScratchAllocator::new(anon_start, block_size);    //APal
+
     let query = read_query(&mut monitor_reader)?;
     let _memory_limit_mb = request_memory_limit(&mut monitor_reader, &mut monitor_writer)?;
 
@@ -1026,7 +1051,7 @@ fn db_main() -> Result<()> {
         }
     }
 
-    let result_source = execute_query_op(&query.root, &ctx, disk_client)?;
+    let result_source = execute_query_op(&query.root, &ctx, disk_client, &mut scratch)?;        //APal
     write_result_to_monitor(result_source, &mut monitor_writer)?;
 
     Ok(())

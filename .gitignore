@@ -1,6 +1,9 @@
 /target
-**/*.json
 /scratch
+**/*.json
 **/*.csv
 **/*.schema
 **/*.bin
+database/src/main.old.rs
+demo_query_printer/src/b.main.rs.backup
+temp.json
