@@ -7,7 +7,7 @@ use common::{
         QueryOp, ScanData, SortData,
     },
 };
-use db_config::{DbContext, table::TableSpec};
+use db_config::{DbContext, statistics::ColumnStat, table::TableSpec};
 use std::{
     cell::RefCell,
     cmp::Ordering,
@@ -290,6 +290,7 @@ fn write_run_to_scratch(
 }
 
 /// Metadata for one sorted run stored in scratch space.
+#[derive(Clone)]
 struct ScratchRunMeta {
     start_block: u64,
     num_blocks: u64,
@@ -433,6 +434,16 @@ struct MaterializedSource {
     rows: std::vec::IntoIter<Row>,
 }
 
+struct ScratchRunsSource {
+    columns: Vec<ColumnMeta>,
+    schema: Vec<DataType>,
+    runs: Vec<ScratchRunMeta>,
+    current_run_idx: usize,
+    current_block_offset: u64,
+    current_rows: std::vec::IntoIter<Row>,
+    disk_client: SharedDiskClient,
+}
+
 impl MaterializedSource {
     fn new(result: ResultSet) -> Self {
         Self {
@@ -449,6 +460,57 @@ impl RowSource for MaterializedSource {
 
     fn next_row(&mut self) -> Result<Option<Row>> {
         Ok(self.rows.next())
+    }
+}
+
+impl ScratchRunsSource {
+    fn new(
+        columns: Vec<ColumnMeta>,
+        schema: Vec<DataType>,
+        runs: Vec<ScratchRunMeta>,
+        disk_client: SharedDiskClient,
+    ) -> Self {
+        Self {
+            columns,
+            schema,
+            runs,
+            current_run_idx: 0,
+            current_block_offset: 0,
+            current_rows: Vec::new().into_iter(),
+            disk_client,
+        }
+    }
+}
+
+impl RowSource for ScratchRunsSource {
+    fn columns(&self) -> &[ColumnMeta] {
+        &self.columns
+    }
+
+    fn next_row(&mut self) -> Result<Option<Row>> {
+        loop {
+            if let Some(row) = self.current_rows.next() {
+                return Ok(Some(row));
+            }
+
+            if self.current_run_idx >= self.runs.len() {
+                return Ok(None);
+            }
+
+            let run = &self.runs[self.current_run_idx];
+            if self.current_block_offset >= run.num_blocks {
+                self.current_run_idx += 1;
+                self.current_block_offset = 0;
+                continue;
+            }
+
+            let block = self
+                .disk_client
+                .borrow_mut()
+                .get_blocks(run.start_block + self.current_block_offset, 1)?;
+            self.current_block_offset += 1;
+            self.current_rows = decode_scratch_block(&block, &self.schema)?.into_iter();
+        }
     }
 }
 
@@ -953,6 +1015,95 @@ fn collect_required_columns_for_filter(
     }
 }
 
+fn collect_required_columns_for_project(
+    project: &ProjectData,
+    required_columns: &mut HashSet<String>,
+) {
+    for (from, _) in &project.column_name_map {
+        required_columns.insert(from.clone());
+    }
+}
+
+fn collect_required_columns_for_sort(
+    sort: &SortData,
+    required_columns: &mut HashSet<String>,
+) {
+    for spec in &sort.sort_specs {
+        required_columns.insert(spec.column_name.clone());
+    }
+}
+
+fn inferred_columns_for_query_op(query_op: &QueryOp, ctx: &DbContext) -> Result<Vec<ColumnMeta>> {
+    match query_op {
+        QueryOp::Scan(ScanData { table_id }) => {
+            let table = find_table(ctx, table_id)?;
+            Ok(table
+                .column_specs
+                .iter()
+                .map(|column| ColumnMeta {
+                    name: column.column_name.clone(),
+                    data_type: column.data_type.clone(),
+                })
+                .collect())
+        }
+        QueryOp::Filter(filter) => inferred_columns_for_query_op(&filter.underlying, ctx),
+        QueryOp::Sort(sort) => inferred_columns_for_query_op(&sort.underlying, ctx),
+        QueryOp::Project(project) => {
+            let input_columns = inferred_columns_for_query_op(&project.underlying, ctx)?;
+            let input_index = build_column_index(&input_columns);
+            project
+                .column_name_map
+                .iter()
+                .map(|(from, to)| {
+                    let idx = *input_index
+                        .get(from.as_str())
+                        .ok_or_else(|| anyhow!("Unknown project column {from}"))?;
+                    Ok(ColumnMeta {
+                        name: to.clone(),
+                        data_type: input_columns[idx].data_type.clone(),
+                    })
+                })
+                .collect()
+        }
+        QueryOp::Cross(cross) => {
+            let mut columns = inferred_columns_for_query_op(&cross.left, ctx)?;
+            columns.extend(inferred_columns_for_query_op(&cross.right, ctx)?);
+            Ok(columns)
+        }
+    }
+}
+
+fn estimated_output_cardinality(
+    query_op: &QueryOp,
+    output_column_name: &str,
+    ctx: &DbContext,
+) -> Option<usize> {
+    match query_op {
+        QueryOp::Scan(ScanData { table_id }) => {
+            let table = find_table(ctx, table_id).ok()?;
+            let column = table
+                .column_specs
+                .iter()
+                .find(|column| column.column_name == output_column_name)?;
+            column.stats.as_ref()?.iter().find_map(|stat| match stat {
+                ColumnStat::CardinalityStat(value) => Some(value.0 as usize),
+                _ => None,
+            })
+        }
+        QueryOp::Filter(filter) => estimated_output_cardinality(&filter.underlying, output_column_name, ctx),
+        QueryOp::Sort(sort) => estimated_output_cardinality(&sort.underlying, output_column_name, ctx),
+        QueryOp::Project(project) => {
+            let source_name = project
+                .column_name_map
+                .iter()
+                .find_map(|(from, to)| (to == output_column_name).then_some(from.as_str()))?;
+            estimated_output_cardinality(&project.underlying, source_name, ctx)
+        }
+        QueryOp::Cross(cross) => estimated_output_cardinality(&cross.left, output_column_name, ctx)
+            .or_else(|| estimated_output_cardinality(&cross.right, output_column_name, ctx)),
+    }
+}
+
 fn comparison_value_to_data(
     value: &ComparisionValue,
     row: &Row,
@@ -1168,6 +1319,46 @@ fn predicate_matches(
     Ok(compare_data(left, &predicate.operator, &right))
 }
 
+fn predicate_is_ready(predicate: &Predicate, column_index: &HashMap<String, usize>) -> bool {
+    if !column_index.contains_key(predicate.column_name.as_str()) {
+        return false;
+    }
+    match &predicate.value {
+        ComparisionValue::Column(name) => column_index.contains_key(name.as_str()),
+        _ => true,
+    }
+}
+
+fn project_rows_in_place(
+    columns: &mut Vec<ColumnMeta>,
+    rows: &mut Vec<Row>,
+    keep_names: &HashSet<String>,
+) {
+    let keep_indices: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| keep_names.contains(column.name.as_str()).then_some(idx))
+        .collect();
+
+    if keep_indices.len() == columns.len() {
+        return;
+    }
+
+    let new_columns: Vec<ColumnMeta> = keep_indices
+        .iter()
+        .map(|idx| columns[*idx].clone())
+        .collect();
+
+    for row in rows.iter_mut() {
+        row.values = keep_indices
+            .iter()
+            .map(|idx| row.values[*idx].clone())
+            .collect();
+    }
+
+    *columns = new_columns;
+}
+
 fn sort_rows(sort: &SortData, rows: &mut [Row], columns: &[ColumnMeta]) -> Result<()> {
     let column_index = build_column_index(columns);
     let sort_columns = sort
@@ -1256,7 +1447,7 @@ fn external_sort(
     // Memory budget: use half the limit for in-memory runs
     let row_est = scratch_row_size_estimate(&schema);
     let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 2) as usize;
-    let run_capacity = (budget_bytes / row_est).max(1024);
+    let run_capacity = (budget_bytes / row_est).clamp(256, 4096);
 
     let block_size = disk_client.borrow().block_size;
     let mut runs: Vec<ScratchRunMeta> = Vec::new();
@@ -1313,94 +1504,979 @@ fn sort_run(rows: &mut Vec<Row>, sort_specs: &[(usize, bool)]) {
 
 // ── Hash Join ────────────────────────────────────────────────────────────────
 
-/// Try to handle Filter(col=col) → Cross as a hash join.
-/// Returns Some(source) on success, None if no equi-join predicate found.
-fn try_hash_join(
+/// Collect all non-Cross leaf QueryOps from an arbitrarily deep left-linear cross chain.
+fn collect_cross_leaves<'a>(op: &'a QueryOp, out: &mut Vec<&'a QueryOp>) {
+    if let QueryOp::Cross(cross) = op {
+        collect_cross_leaves(&cross.left, out);
+        collect_cross_leaves(&cross.right, out);
+    } else {
+        out.push(op);
+    }
+}
+
+fn execute_join_leaf(
+    query_op: &QueryOp,
+    ctx: &DbContext,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+    required_columns: Option<&HashSet<String>>,
+) -> Result<Box<dyn RowSource>> {
+    match query_op {
+        QueryOp::Scan(ScanData { table_id }) => {
+            let table = find_table(ctx, table_id)?;
+            Ok(Box::new(ScanSource::new(table, disk_client, required_columns)?))
+        }
+        QueryOp::Filter(filter) => {
+            if let QueryOp::Scan(ScanData { table_id }) = filter.underlying.as_ref() {
+                let table = find_table(ctx, table_id)?;
+                let mut leaf_required = required_columns.cloned().unwrap_or_default();
+                collect_required_columns_for_filter(filter, &mut leaf_required);
+                let scan = ScanSource::new(table, disk_client, Some(&leaf_required))?;
+                return Ok(Box::new(FilterSource::new(filter, Box::new(scan))));
+            }
+            execute_query_op(query_op, ctx, disk_client, scratch, memory_limit_mb)
+        }
+        _ => execute_query_op(query_op, ctx, disk_client, scratch, memory_limit_mb),
+    }
+}
+
+/// Execute Filter(Cross(...)) using a streaming N-way grace hash join with predicate pushdown.
+///
+/// Algorithm:
+///   1. Flatten the cross chain into N leaf ops.
+///   2. Peek at each leaf to get its column schema (without materializing rows).
+///   3. Build col_name → leaf_index map from schemas.
+///   4. Apply predicate pushdown: compile single-table predicates per leaf.
+///   5. Greedy join order: find equi-join pairs. For each pair:
+///      a. Stream-partition BOTH sides directly to scratch (never hold >1 partition in memory).
+///      b. Join partition-by-partition.
+///      c. The result becomes the new "accumulated" side.
+///   6. Any unjoined leaf (no join predicate) gets cross-producted — expected tiny tables.
+///   7. Apply final filter on accumulated result.
+fn execute_filter_cross(
     filter: &FilterData,
     cross: &CrossData,
     ctx: &DbContext,
     disk_client: SharedDiskClient,
     scratch: &mut ScratchAllocator,
     memory_limit_mb: u64,
-) -> Result<Option<Box<dyn RowSource>>> {
-    // Execute both sides to discover their column schemas
-    let left_src = execute_query_op(
-        &cross.left, ctx, disk_client.clone(), scratch, memory_limit_mb,
-    )?;
-    let right_src = execute_query_op(
-        &cross.right, ctx, disk_client.clone(), scratch, memory_limit_mb,
-    )?;
+    required_columns: Option<&HashSet<String>>,
+) -> Result<Box<dyn RowSource>> {
+    // 1. Flatten cross chain
+    let mut leaf_ops: Vec<&QueryOp> = Vec::new();
+    collect_cross_leaves(&cross.left, &mut leaf_ops);
+    collect_cross_leaves(&cross.right, &mut leaf_ops);
+    let n = leaf_ops.len();
 
-    let left_cols = left_src.columns().to_vec();
-    let right_cols = right_src.columns().to_vec();
+    let leaf_output_columns: Vec<Vec<ColumnMeta>> = leaf_ops
+        .iter()
+        .map(|op| inferred_columns_for_query_op(op, ctx))
+        .collect::<Result<_>>()?;
 
-    let left_map: HashMap<&str, usize> = left_cols.iter().enumerate()
-        .map(|(i, c)| (c.name.as_str(), i)).collect();
-    let right_map: HashMap<&str, usize> = right_cols.iter().enumerate()
-        .map(|(i, c)| (c.name.as_str(), i)).collect();
-
-    // Find the first equi-join predicate (col_left = col_right or col_right = col_left)
-    let mut equi: Option<(usize, usize)> = None;  // (left_col_idx, right_col_idx)
-    let mut remaining: Vec<Predicate> = Vec::new();
-
-    for pred in &filter.predicates {
-        let found = if matches!(pred.operator, ComparisionOperator::EQ) {
-            if let ComparisionValue::Column(other) = &pred.value {
-                if let (Some(&li), Some(&ri)) = (left_map.get(pred.column_name.as_str()),
-                                                  right_map.get(other.as_str())) {
-                    equi.get_or_insert((li, ri)); true
-                } else if let (Some(&ri), Some(&li)) = (right_map.get(pred.column_name.as_str()),
-                                                          left_map.get(other.as_str())) {
-                    equi.get_or_insert((li, ri)); true
-                } else { false }
-            } else { false }
-        } else { false };
-        if !found { remaining.push(pred.clone()); }
+    let mut col_to_leaf: HashMap<String, usize> = HashMap::new();
+    for (li, cols) in leaf_output_columns.iter().enumerate() {
+        for c in cols {
+            col_to_leaf.insert(c.name.clone(), li);
+        }
     }
 
-    let (left_key_idx, right_key_idx) = match equi {
-        None => return Ok(None),
-        Some(pair) => pair,
-    };
-
-    // Build phase: materialise the left side into a hash table
-    let left_result = materialize_source(left_src)?;
-    let mut hash_table: HashMap<DataKey, Vec<Row>> = HashMap::new();
-    for row in left_result.rows {
-        let key = DataKey(row.values[left_key_idx].clone());
-        hash_table.entry(key).or_default().push(row);
+    let mut per_leaf_required = vec![HashSet::new(); n];
+    let mut join_required = HashSet::new();
+    collect_required_columns_for_filter(filter, &mut join_required);
+    if let Some(required) = required_columns {
+        join_required.extend(required.iter().cloned());
+    }
+    for column_name in join_required {
+        if let Some(&leaf_idx) = col_to_leaf.get(column_name.as_str()) {
+            per_leaf_required[leaf_idx].insert(column_name);
+        }
     }
 
-    // Probe phase: stream the right side and emit matching pairs
-    let mut combined_cols: Vec<ColumnMeta> = left_cols.clone();
-    combined_cols.extend_from_slice(&right_cols);
-    let mut join_rows: Vec<Row> = Vec::new();
-    let mut right = right_src;
-    while let Some(rrow) = right.next_row()? {
-        let key = DataKey(rrow.values[right_key_idx].clone());
-        if let Some(lrows) = hash_table.get(&key) {
-            for lrow in lrows {
-                let mut values = lrow.values.clone();
-                values.extend_from_slice(&rrow.values);
-                join_rows.push(Row { values });
+    // 2. Build each leaf as a RowSource (streaming, not materialized yet).
+    //    Also capture the column schema from each source.
+    //    We need to peek at columns before consuming rows, so we create the sources
+    //    and extract column metadata immediately.
+    let mut leaf_sources: Vec<Option<Box<dyn RowSource>>> = leaf_ops
+        .iter()
+        .enumerate()
+        .map(|(li, op)| {
+            Ok(Some(execute_join_leaf(
+                op,
+                ctx,
+                disk_client.clone(),
+                scratch,
+                memory_limit_mb,
+                Some(&per_leaf_required[li]),
+            )?))
+        })
+        .collect::<Result<_>>()?;
+
+    let leaf_cols: Vec<Vec<ColumnMeta>> = leaf_sources.iter()
+        .map(|s| s.as_ref().unwrap().columns().to_vec())
+        .collect();
+
+    // 3. Compile single-table filter predicates per leaf (for pushdown during streaming)
+    let leaf_single_preds: Vec<Vec<CompiledPredicate>> = (0..n).map(|li| {
+        let col_idx = build_column_index(&leaf_cols[li]);
+        filter.predicates.iter().filter_map(|pred| {
+            let left_leaf = col_to_leaf.get(&pred.column_name).copied();
+            let right_leaf = match &pred.value {
+                ComparisionValue::Column(c) => col_to_leaf.get(c.as_str()).copied(),
+                _ => None,
+            };
+            let is_single = match (left_leaf, right_leaf) {
+                (Some(ll), None) if ll == li => true,
+                (Some(ll), Some(rl)) if ll == li && rl == li => true,
+                _ => false,
+            };
+            if is_single {
+                compile_predicate(pred, &col_idx).ok()
+            } else {
+                None
+            }
+        }).collect()
+    }).collect();
+
+    let leaf_materialized: Vec<MaterializedLeaf> = leaf_sources
+        .into_iter()
+        .enumerate()
+        .map(|(li, source)| {
+            materialize_filtered_source_to_scratch(
+                source.unwrap(),
+                &leaf_single_preds[li],
+                disk_client.clone(),
+                scratch,
+                memory_limit_mb,
+            )
+        })
+        .collect::<Result<_>>()?;
+
+    let block_size = disk_client.borrow().block_size;
+    let seed_idx = leaf_materialized
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, leaf)| leaf.row_count)
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+
+    let mut joined = vec![false; n];
+    joined[seed_idx] = true;
+    let mut acc_leaf = rewrite_leaf_to_scratch(
+        &leaf_materialized[seed_idx],
+        filter,
+        &joined,
+        &col_to_leaf,
+        required_columns,
+        disk_client.clone(),
+        scratch,
+        memory_limit_mb,
+    )?;
+
+    loop {
+        let acc_map: HashMap<&str, usize> = acc_leaf
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.as_str(), i))
+            .collect();
+        let mut best_join: Option<(usize, usize, usize, usize)> = None;
+
+        for li in 0..n {
+            if joined[li] {
+                continue;
+            }
+
+            let leaf_map: HashMap<&str, usize> = leaf_materialized[li]
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.name.as_str(), i))
+                .collect();
+
+            let mut join_keys: Option<(usize, usize)> = None;
+            for pred in &filter.predicates {
+                if !matches!(pred.operator, ComparisionOperator::EQ) {
+                    continue;
+                }
+                if let ComparisionValue::Column(other) = &pred.value {
+                    if let (Some(&ai), Some(&li_idx)) = (
+                        acc_map.get(pred.column_name.as_str()),
+                        leaf_map.get(other.as_str()),
+                    ) {
+                        join_keys = Some((ai, li_idx));
+                        break;
+                    }
+                    if let (Some(&li_idx), Some(&ai)) = (
+                        leaf_map.get(pred.column_name.as_str()),
+                        acc_map.get(other.as_str()),
+                    ) {
+                        join_keys = Some((ai, li_idx));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((acc_key, leaf_key)) = join_keys {
+                let leaf_key_name = &leaf_materialized[li].columns[leaf_key].name;
+                let key_cardinality = estimated_output_cardinality(
+                    leaf_ops[li],
+                    leaf_key_name,
+                    ctx,
+                )
+                .unwrap_or(1)
+                .max(1);
+
+                let better = best_join
+                    .map(|(best_li, _, _, best_cardinality)| {
+                        leaf_materialized[li].row_count * best_cardinality
+                            < leaf_materialized[best_li].row_count * key_cardinality
+                    })
+                    .unwrap_or(true);
+                if better {
+                    best_join = Some((li, acc_key, leaf_key, key_cardinality));
+                }
+            }
+        }
+
+        let Some((li, acc_key, leaf_key, _)) = best_join else {
+            break;
+        };
+
+        let mut output_columns = acc_leaf.columns.clone();
+        output_columns.extend_from_slice(&leaf_materialized[li].columns);
+        let joined_leaf = join_leaves_to_scratch(
+            &acc_leaf,
+            acc_key,
+            &leaf_materialized[li],
+            leaf_key,
+            output_columns,
+            disk_client.clone(),
+            scratch,
+            memory_limit_mb,
+        )?;
+        joined[li] = true;
+        acc_leaf = rewrite_leaf_to_scratch(
+            &joined_leaf,
+            filter,
+            &joined,
+            &col_to_leaf,
+            required_columns,
+            disk_client.clone(),
+            scratch,
+            memory_limit_mb,
+        )?;
+    }
+
+    // 5. Cross-product any unjoined leaves (no eq-join pred — expected tiny tables)
+    for li in 0..n {
+        if joined[li] { continue; }
+        let acc_rows = load_scratch_runs(
+            &acc_leaf.runs,
+            &acc_leaf.schema,
+            disk_client.clone(),
+            block_size,
+        )?;
+        let leaf_rows = load_scratch_runs(
+            &leaf_materialized[li].runs,
+            &leaf_materialized[li].schema,
+            disk_client.clone(),
+            block_size,
+        )?;
+        let mut new_rows = Vec::with_capacity(acc_rows.len().saturating_mul(leaf_rows.len()));
+        for acc_row in &acc_rows {
+            for leaf_row in &leaf_rows {
+                let mut values = acc_row.values.clone();
+                values.extend_from_slice(&leaf_row.values);
+                new_rows.push(Row { values });
+            }
+        }
+        let mut new_cols = acc_leaf.columns.clone();
+        new_cols.extend(leaf_materialized[li].columns.clone());
+        let tmp_leaf = MaterializedLeaf {
+            columns: new_cols.clone(),
+            schema: new_cols.iter().map(|c| c.data_type.clone()).collect(),
+            runs: {
+                let schema: Vec<DataType> = new_cols.iter().map(|c| c.data_type.clone()).collect();
+                let meta = write_run_to_scratch(&new_rows, &schema, disk_client.clone(), scratch)?;
+                vec![meta]
+            },
+            row_count: new_rows.len(),
+        };
+        joined[li] = true;
+        acc_leaf = rewrite_leaf_to_scratch(
+            &tmp_leaf,
+            filter,
+            &joined,
+            &col_to_leaf,
+            required_columns,
+            disk_client.clone(),
+            scratch,
+            memory_limit_mb,
+        )?;
+    }
+
+    // 6. Apply all filter predicates on final result
+    let final_leaf = rewrite_leaf_to_scratch(
+        &acc_leaf,
+        filter,
+        &joined,
+        &col_to_leaf,
+        required_columns,
+        disk_client.clone(),
+        scratch,
+        memory_limit_mb,
+    )?;
+
+    Ok(Box::new(ScratchRunsSource::new(
+        final_leaf.columns,
+        final_leaf.schema,
+        final_leaf.runs,
+        disk_client,
+    )))
+}
+
+// ── Grace Hash Join ───────────────────────────────────────────────────────────
+
+/// Hash key value to a partition number using a simple hash.
+fn partition_of(val: &Data, num_partitions: usize) -> usize {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    match val {
+        Data::Int32(v)   => { 0u8.hash(&mut h); v.hash(&mut h); }
+        Data::Int64(v)   => { 1u8.hash(&mut h); v.hash(&mut h); }
+        Data::Float32(v) => { 2u8.hash(&mut h); v.to_bits().hash(&mut h); }
+        Data::Float64(v) => { 3u8.hash(&mut h); v.to_bits().hash(&mut h); }
+        Data::String(v)  => { 4u8.hash(&mut h); v.hash(&mut h); }
+    }
+    (h.finish() as usize) % num_partitions
+}
+
+/// Grace hash join between `left` (probe side) and `right` (build side).
+///
+/// If the build side fits in `budget_bytes`, fall back to a simple in-memory hash join.
+/// Otherwise partition both sides to scratch, then join one partition at a time.
+fn grace_hash_join(
+    left: &[Row],   left_key:  usize,
+    right: &[Row],  right_key: usize,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<Vec<Row>> {
+    // Budget = 1/3 of memory limit for the build-side hash table of one partition.
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
+
+    // Estimate right (build) side memory.
+    // Simple heuristic: count bytes in encoded form (8 bytes per numeric, string len).
+    let right_est: usize = right.iter().map(|r| {
+        r.values.iter().map(|v| match v {
+            Data::String(s) => s.len() + 2,
+            _ => 8,
+        }).sum::<usize>() + 24
+    }).sum();
+
+    if right_est <= budget_bytes {
+        // Fast path: right side fits in memory — simple hash join.
+        return Ok(simple_hash_join(left, left_key, right, right_key));
+    }
+
+    // Compute number of partitions so each partition's build side fits in budget.
+    let num_partitions = ((right_est / budget_bytes) + 1).max(2).min(256);
+
+    // Determine schemas from the rows (fall back to empty if no rows).
+    let left_schema: Vec<DataType> = if let Some(r) = left.first() {
+        r.values.iter().map(|v| match v {
+            Data::Int32(_)   => DataType::Int32,
+            Data::Int64(_)   => DataType::Int64,
+            Data::Float32(_) => DataType::Float32,
+            Data::Float64(_) => DataType::Float64,
+            Data::String(_)  => DataType::String,
+        }).collect()
+    } else { vec![] };
+
+    let right_schema: Vec<DataType> = if let Some(r) = right.first() {
+        r.values.iter().map(|v| match v {
+            Data::Int32(_)   => DataType::Int32,
+            Data::Int64(_)   => DataType::Int64,
+            Data::Float32(_) => DataType::Float32,
+            Data::Float64(_) => DataType::Float64,
+            Data::String(_)  => DataType::String,
+        }).collect()
+    } else { vec![] };
+
+    let block_size = disk_client.borrow().block_size;
+
+    // Partition left side into scratch.
+    let mut left_part_bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    for row in left {
+        let p = partition_of(&row.values[left_key], num_partitions);
+        left_part_bufs[p].push(row.clone());
+    }
+    let left_runs: Vec<ScratchRunMeta> = left_part_bufs.iter().map(|rows| {
+        write_run_to_scratch(rows, &left_schema, disk_client.clone(), scratch)
+    }).collect::<Result<_>>()?;
+    drop(left_part_bufs);
+
+    // Partition right side into scratch.
+    let mut right_part_bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    for row in right {
+        let p = partition_of(&row.values[right_key], num_partitions);
+        right_part_bufs[p].push(row.clone());
+    }
+    let right_runs: Vec<ScratchRunMeta> = right_part_bufs.iter().map(|rows| {
+        write_run_to_scratch(rows, &right_schema, disk_client.clone(), scratch)
+    }).collect::<Result<_>>()?;
+    drop(right_part_bufs);
+
+    // Join each partition pair.
+    let mut output: Vec<Row> = Vec::new();
+    for p in 0..num_partitions {
+        // Load right partition (build side).
+        let right_part = load_scratch_run(&right_runs[p], &right_schema, disk_client.clone(), block_size)?;
+        if right_part.is_empty() { continue; }
+
+        // Load left partition (probe side).
+        let left_part = load_scratch_run(&left_runs[p], &left_schema, disk_client.clone(), block_size)?;
+        if left_part.is_empty() { continue; }
+
+        // In-memory hash join for this partition.
+        let joined = simple_hash_join(&left_part, left_key, &right_part, right_key);
+        output.extend(joined);
+    }
+
+    Ok(output)
+}
+
+/// Load all rows from a scratch run.
+fn load_scratch_run(
+    run: &ScratchRunMeta,
+    schema: &[DataType],
+    disk_client: SharedDiskClient,
+    block_size: usize,
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    for block_offset in 0..run.num_blocks {
+        let block_data = disk_client.borrow_mut()
+            .get_blocks(run.start_block + block_offset, 1)?;
+        rows.extend(decode_scratch_block(&block_data, schema)?);
+    }
+    Ok(rows)
+}
+
+fn load_scratch_runs(
+    runs: &[ScratchRunMeta],
+    schema: &[DataType],
+    disk_client: SharedDiskClient,
+    block_size: usize,
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    for run in runs {
+        rows.extend(load_scratch_run(run, schema, disk_client.clone(), block_size)?);
+    }
+    Ok(rows)
+}
+
+#[derive(Clone)]
+struct MaterializedLeaf {
+    columns: Vec<ColumnMeta>,
+    schema: Vec<DataType>,
+    runs: Vec<ScratchRunMeta>,
+    row_count: usize,
+}
+
+fn materialize_filtered_source_to_scratch(
+    mut source: Box<dyn RowSource>,
+    predicates: &[CompiledPredicate],
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<MaterializedLeaf> {
+    let columns = source.columns().to_vec();
+    let schema: Vec<DataType> = columns.iter().map(|column| column.data_type.clone()).collect();
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 8) as usize)
+        / scratch_row_size_estimate(&schema))
+        .clamp(256, 4096);
+
+    let mut runs = Vec::new();
+    let mut row_count = 0usize;
+    let mut buffer = Vec::with_capacity(row_capacity);
+
+    while let Some(row) = source.next_row()? {
+        if predicates
+            .iter()
+            .all(|predicate| compiled_predicate_matches(predicate, &row).unwrap_or(false))
+        {
+            row_count += 1;
+            buffer.push(row);
+            if buffer.len() >= row_capacity {
+                runs.push(write_run_to_scratch(
+                    &buffer,
+                    &schema,
+                    disk_client.clone(),
+                    scratch,
+                )?);
+                buffer.clear();
             }
         }
     }
 
-    let joined: Box<dyn RowSource> = Box::new(MaterializedSource::new(
-        ResultSet { columns: combined_cols, rows: join_rows },
-    ));
-
-    // Apply any remaining (non-equi-join) predicates
-    if remaining.is_empty() {
-        Ok(Some(joined))
-    } else {
-        let dummy_filter = FilterData {
-            predicates: remaining,
-            underlying: Box::new(QueryOp::Scan(ScanData { table_id: String::new() })),
-        };
-        Ok(Some(Box::new(FilterSource::new(&dummy_filter, joined))))
+    if !buffer.is_empty() {
+        runs.push(write_run_to_scratch(
+            &buffer,
+            &schema,
+            disk_client,
+            scratch,
+        )?);
     }
+
+    Ok(MaterializedLeaf {
+        columns,
+        schema,
+        runs,
+        row_count,
+    })
+}
+
+fn make_leaf_source(leaf: &MaterializedLeaf, disk_client: SharedDiskClient) -> Box<dyn RowSource> {
+    Box::new(ScratchRunsSource::new(
+        leaf.columns.clone(),
+        leaf.schema.clone(),
+        leaf.runs.clone(),
+        disk_client,
+    ))
+}
+
+fn compute_keep_names(
+    filter: &FilterData,
+    joined: &[bool],
+    col_to_leaf: &HashMap<String, usize>,
+    required_columns: Option<&HashSet<String>>,
+) -> HashSet<String> {
+    let mut keep_names = required_columns.cloned().unwrap_or_default();
+
+    for predicate in &filter.predicates {
+        let left_leaf = col_to_leaf.get(predicate.column_name.as_str()).copied();
+        let right_leaf = match &predicate.value {
+            ComparisionValue::Column(name) => col_to_leaf.get(name.as_str()).copied(),
+            _ => None,
+        };
+
+        if let (Some(joined_leaf), Some(unjoined_leaf)) = (left_leaf, right_leaf) {
+            if joined[joined_leaf] && !joined[unjoined_leaf] {
+                keep_names.insert(predicate.column_name.clone());
+            }
+        }
+
+        if let (Some(unjoined_leaf), Some(joined_leaf)) = (left_leaf, right_leaf) {
+            if !joined[unjoined_leaf] && joined[joined_leaf] {
+                if let ComparisionValue::Column(name) = &predicate.value {
+                    keep_names.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    keep_names
+}
+
+fn partition_source_to_scratch(
+    mut source: Box<dyn RowSource>,
+    key_idx: usize,
+    schema: &[DataType],
+    num_partitions: usize,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+) -> Result<Vec<Vec<ScratchRunMeta>>> {
+    const WRITE_BUF: usize = 128;
+
+    let mut bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    let mut runs: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
+
+    while let Some(row) = source.next_row()? {
+        let p = partition_of(&row.values[key_idx], num_partitions);
+        bufs[p].push(row);
+        if bufs[p].len() >= WRITE_BUF {
+            let meta = write_run_to_scratch(&bufs[p], schema, disk_client.clone(), scratch)?;
+            runs[p].push(meta);
+            bufs[p].clear();
+        }
+    }
+
+    for p in 0..num_partitions {
+        if !bufs[p].is_empty() {
+            let meta = write_run_to_scratch(&bufs[p], schema, disk_client.clone(), scratch)?;
+            runs[p].push(meta);
+            bufs[p].clear();
+        }
+    }
+
+    Ok(runs)
+}
+
+fn join_leaves_to_scratch(
+    left_leaf: &MaterializedLeaf,
+    left_key: usize,
+    right_leaf: &MaterializedLeaf,
+    right_key: usize,
+    output_columns: Vec<ColumnMeta>,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<MaterializedLeaf> {
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
+    let right_est = right_leaf.row_count
+        .saturating_mul(scratch_row_size_estimate(&right_leaf.schema));
+    let num_partitions = if right_est <= budget_bytes {
+        1usize
+    } else {
+        ((right_est / budget_bytes) + 1).max(2).min(256)
+    };
+
+    let left_parts = partition_source_to_scratch(
+        make_leaf_source(left_leaf, disk_client.clone()),
+        left_key,
+        &left_leaf.schema,
+        num_partitions,
+        disk_client.clone(),
+        scratch,
+    )?;
+    let right_parts = partition_source_to_scratch(
+        make_leaf_source(right_leaf, disk_client.clone()),
+        right_key,
+        &right_leaf.schema,
+        num_partitions,
+        disk_client.clone(),
+        scratch,
+    )?;
+
+    let output_schema: Vec<DataType> = output_columns
+        .iter()
+        .map(|column| column.data_type.clone())
+        .collect();
+    let block_size = disk_client.borrow().block_size;
+    let mut runs = Vec::new();
+    let mut row_count = 0usize;
+    let mut out_buf: Vec<Row> = Vec::with_capacity(128);
+
+    for p in 0..num_partitions {
+        let right_part =
+            load_scratch_runs(&right_parts[p], &right_leaf.schema, disk_client.clone(), block_size)?;
+        if right_part.is_empty() {
+            continue;
+        }
+
+        let left_part =
+            load_scratch_runs(&left_parts[p], &left_leaf.schema, disk_client.clone(), block_size)?;
+        if left_part.is_empty() {
+            continue;
+        }
+
+        let mut ht: HashMap<DataKey, Vec<&Row>> = HashMap::new();
+        for row in &right_part {
+            ht.entry(DataKey(row.values[right_key].clone()))
+                .or_default()
+                .push(row);
+        }
+
+        for left_row in &left_part {
+            let key = DataKey(left_row.values[left_key].clone());
+            if let Some(matches) = ht.get(&key) {
+                for right_row in matches {
+                    let mut values = left_row.values.clone();
+                    values.extend_from_slice(&right_row.values);
+                    out_buf.push(Row { values });
+                    row_count += 1;
+
+                    if out_buf.len() >= 128 {
+                        runs.push(write_run_to_scratch(
+                            &out_buf,
+                            &output_schema,
+                            disk_client.clone(),
+                            scratch,
+                        )?);
+                        out_buf.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    if !out_buf.is_empty() {
+        runs.push(write_run_to_scratch(
+            &out_buf,
+            &output_schema,
+            disk_client,
+            scratch,
+        )?);
+    }
+
+    Ok(MaterializedLeaf {
+        columns: output_columns,
+        schema: output_schema,
+        runs,
+        row_count,
+    })
+}
+
+fn rewrite_leaf_to_scratch(
+    leaf: &MaterializedLeaf,
+    filter: &FilterData,
+    joined: &[bool],
+    col_to_leaf: &HashMap<String, usize>,
+    required_columns: Option<&HashSet<String>>,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<MaterializedLeaf> {
+    let keep_names = compute_keep_names(filter, joined, col_to_leaf, required_columns);
+    let keep_indices: Vec<usize> = leaf
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, column)| keep_names.contains(column.name.as_str()).then_some(idx))
+        .collect();
+    let columns: Vec<ColumnMeta> = keep_indices
+        .iter()
+        .map(|idx| leaf.columns[*idx].clone())
+        .collect();
+    let schema: Vec<DataType> = columns
+        .iter()
+        .map(|column| column.data_type.clone())
+        .collect();
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 8) as usize)
+        / scratch_row_size_estimate(&schema))
+        .clamp(256, 4096);
+    let current_col_idx = build_column_index(&leaf.columns);
+
+    let mut source = make_leaf_source(leaf, disk_client.clone());
+    let mut runs = Vec::new();
+    let mut row_count = 0usize;
+    let mut buffer: Vec<Row> = Vec::with_capacity(row_capacity);
+
+    while let Some(row) = source.next_row()? {
+        if filter.predicates.iter().all(|predicate| {
+            !predicate_is_ready(predicate, &current_col_idx)
+                || predicate_matches(predicate, &row, &current_col_idx).unwrap_or(false)
+        }) {
+            row_count += 1;
+            buffer.push(Row {
+                values: keep_indices
+                    .iter()
+                    .map(|idx| row.values[*idx].clone())
+                    .collect(),
+            });
+
+            if buffer.len() >= row_capacity {
+                runs.push(write_run_to_scratch(
+                    &buffer,
+                    &schema,
+                    disk_client.clone(),
+                    scratch,
+                )?);
+                buffer.clear();
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        runs.push(write_run_to_scratch(
+            &buffer,
+            &schema,
+            disk_client,
+            scratch,
+        )?);
+    }
+
+    Ok(MaterializedLeaf {
+        columns,
+        schema,
+        runs,
+        row_count,
+    })
+}
+
+/// Simple in-memory hash join (build hash table on right, probe with left).
+fn simple_hash_join(
+    left: &[Row],  left_key:  usize,
+    right: &[Row], right_key: usize,
+) -> Vec<Row> {
+    let mut ht: HashMap<DataKey, Vec<&Row>> = HashMap::new();
+    for row in right {
+        ht.entry(DataKey(row.values[right_key].clone()))
+            .or_default()
+            .push(row);
+    }
+    let mut output = Vec::new();
+    for left_row in left {
+        let key = DataKey(left_row.values[left_key].clone());
+        if let Some(matches) = ht.get(&key) {
+            for right_row in matches {
+                let mut values = left_row.values.clone();
+                values.extend_from_slice(&right_row.values);
+                output.push(Row { values });
+            }
+        }
+    }
+    output
+}
+
+/// Grace hash join where the right side is a streaming RowSource (not yet materialized).
+///
+/// 1. Stream right source through predicate filter, writing each row into a scratch partition
+///    determined by hash(row[right_key]).  Uses a per-partition write buffer (512 rows) to
+///    avoid per-row disk writes.
+/// 2. Partition the left (already materialized) side the same way.
+/// 3. Join each partition pair in-memory.
+fn streaming_grace_hash_join(
+    left: &[Row],         left_key:    usize,
+    left_schema:  &[DataType],
+    mut right_src: Box<dyn RowSource>,
+    right_key:   usize,
+    right_schema: &[DataType],
+    right_preds: &[CompiledPredicate],
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<Vec<Row>> {
+    // Budget = 1/3 of memory limit for a single partition's hash table.
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
+
+    // Decide partition count based on a rough right-side size estimate.
+    // We peek at up to 1024 rows to estimate avg row size, keeping them buffered.
+    const SAMPLE_SIZE: usize = 128;
+    let mut sample: Vec<Row> = Vec::with_capacity(SAMPLE_SIZE);
+    while sample.len() < SAMPLE_SIZE {
+        match right_src.next_row()? {
+            None => break,
+            Some(row) => {
+                if right_preds.iter().all(|p| compiled_predicate_matches(p, &row).unwrap_or(false)) {
+                    sample.push(row);
+                }
+            }
+        }
+    }
+
+    // Estimate total right size using sample avg * right row count heuristic.
+    // Since we don't know total right count, use a conservative estimate.
+    let sample_bytes: usize = sample.iter().map(|r| {
+        r.values.iter().map(|v| match v {
+            Data::String(s) => s.len() + 2,
+            _ => 8,
+        }).sum::<usize>() + 24
+    }).sum();
+    let avg_row_bytes = if sample.is_empty() { 64 } else { sample_bytes / sample.len() };
+    // Conservative total estimate: assume right table ~ sample_size * 1000 rows if we
+    // hit the sample limit, otherwise just sample.len() rows total.
+    let est_total = if sample.len() < SAMPLE_SIZE {
+        sample.len() * avg_row_bytes
+    } else {
+        sample.len() * avg_row_bytes * 1000 // very conservative upper bound
+    };
+
+    let num_partitions = if est_total <= budget_bytes {
+        1usize
+    } else {
+        ((est_total / budget_bytes) + 1).max(2).min(256)
+    };
+
+    let block_size = disk_client.borrow().block_size;
+
+    // ------------------------------------------------------------------
+    // Stream right source into scratch partitions (write buffer per part)
+    // ------------------------------------------------------------------
+    const WRITE_BUF: usize = 128; // rows per partition before flushing to scratch
+    let mut right_bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    let mut right_run_parts: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
+
+    // Helper: flush one partition buffer to scratch
+    let flush_partition = |p: usize, bufs: &mut Vec<Vec<Row>>, run_parts: &mut Vec<Vec<ScratchRunMeta>>,
+                           disk_client: &SharedDiskClient, scratch: &mut ScratchAllocator,
+                           schema: &[DataType]| -> Result<()> {
+        if bufs[p].is_empty() { return Ok(()); }
+        let meta = write_run_to_scratch(&bufs[p], schema, disk_client.clone(), scratch)?;
+        run_parts[p].push(meta);
+        bufs[p].clear();
+        Ok(())
+    };
+
+    // Process the already-sampled rows
+    for row in sample {
+        let p = partition_of(&row.values[right_key], num_partitions);
+        right_bufs[p].push(row);
+        if right_bufs[p].len() >= WRITE_BUF {
+            flush_partition(p, &mut right_bufs, &mut right_run_parts, &disk_client, scratch, right_schema)?;
+        }
+    }
+
+    // Process remaining rows from stream
+    while let Some(row) = right_src.next_row()? {
+        if !right_preds.iter().all(|p| compiled_predicate_matches(p, &row).unwrap_or(false)) {
+            continue;
+        }
+        let p = partition_of(&row.values[right_key], num_partitions);
+        right_bufs[p].push(row);
+        if right_bufs[p].len() >= WRITE_BUF {
+            flush_partition(p, &mut right_bufs, &mut right_run_parts, &disk_client, scratch, right_schema)?;
+        }
+    }
+    // Flush remaining buffers
+    for p in 0..num_partitions {
+        flush_partition(p, &mut right_bufs, &mut right_run_parts, &disk_client, scratch, right_schema)?;
+    }
+    drop(right_bufs);
+
+    // ------------------------------------------------------------------
+    // Partition left side the same way
+    // ------------------------------------------------------------------
+    let mut left_bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
+    let mut left_run_parts: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
+
+    for row in left {
+        let p = partition_of(&row.values[left_key], num_partitions);
+        left_bufs[p].push(row.clone());
+        if left_bufs[p].len() >= WRITE_BUF {
+            if let Ok(meta) = write_run_to_scratch(&left_bufs[p], left_schema, disk_client.clone(), scratch) {
+                left_run_parts[p].push(meta);
+            }
+            left_bufs[p].clear();
+        }
+    }
+    for p in 0..num_partitions {
+        if !left_bufs[p].is_empty() {
+            if let Ok(meta) = write_run_to_scratch(&left_bufs[p], left_schema, disk_client.clone(), scratch) {
+                left_run_parts[p].push(meta);
+            }
+            left_bufs[p].clear();
+        }
+    }
+    drop(left_bufs);
+
+    // ------------------------------------------------------------------
+    // Join each partition pair in-memory
+    // ------------------------------------------------------------------
+    let mut output: Vec<Row> = Vec::new();
+
+    for p in 0..num_partitions {
+        // Load right partition (build side)
+        let mut right_part: Vec<Row> = Vec::new();
+        for run in &right_run_parts[p] {
+            right_part.extend(load_scratch_run(run, right_schema, disk_client.clone(), block_size)?);
+        }
+        if right_part.is_empty() { continue; }
+
+        // Load left partition (probe side)
+        let mut left_part: Vec<Row> = Vec::new();
+        for run in &left_run_parts[p] {
+            left_part.extend(load_scratch_run(run, left_schema, disk_client.clone(), block_size)?);
+        }
+        if left_part.is_empty() { continue; }
+
+        let joined = simple_hash_join(&left_part, left_key, &right_part, right_key);
+        output.extend(joined);
+    }
+
+    Ok(output)
 }
 
 fn execute_query_op(
@@ -1416,19 +2492,55 @@ fn execute_query_op(
             Ok(Box::new(ScanSource::new(table, disk_client, None)?))
         }
         QueryOp::Filter(filter) => {
-            // Check for equi-join (Filter -> Cross) pattern
+            // Filter over a Cross chain → use N-way hash join with predicate pushdown
             if let QueryOp::Cross(cross) = filter.underlying.as_ref() {
-                if let Some(joined) = try_hash_join(
-                    filter, cross, ctx, disk_client.clone(), scratch, memory_limit_mb
-                )? {
-                    return Ok(joined);
-                }
+                return execute_filter_cross(
+                    filter, cross, ctx, disk_client, scratch, memory_limit_mb, None,
+                );
             }
-
-            let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch, memory_limit_mb)?;       //APal
+            let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch, memory_limit_mb)?;
             Ok(Box::new(FilterSource::new(filter, child)))
         }
         QueryOp::Project(project) => {
+            if let QueryOp::Filter(filter) = project.underlying.as_ref() {
+                if let QueryOp::Cross(cross) = filter.underlying.as_ref() {
+                    let mut required_columns = HashSet::new();
+                    collect_required_columns_for_project(project, &mut required_columns);
+                    let child = execute_filter_cross(
+                        filter,
+                        cross,
+                        ctx,
+                        disk_client,
+                        scratch,
+                        memory_limit_mb,
+                        Some(&required_columns),
+                    )?;
+                    return Ok(Box::new(ProjectSource::new(project, child)?));
+                }
+            }
+
+            if let QueryOp::Sort(sort) = project.underlying.as_ref() {
+                if let QueryOp::Filter(filter) = sort.underlying.as_ref() {
+                    if let QueryOp::Cross(cross) = filter.underlying.as_ref() {
+                        let mut required_columns = HashSet::new();
+                        collect_required_columns_for_project(project, &mut required_columns);
+                        collect_required_columns_for_sort(sort, &mut required_columns);
+                        let child = execute_filter_cross(
+                            filter,
+                            cross,
+                            ctx,
+                            disk_client.clone(),
+                            scratch,
+                            memory_limit_mb,
+                            Some(&required_columns),
+                        )?;
+                        let sorted =
+                            external_sort(sort, child, disk_client, scratch, memory_limit_mb)?;
+                        return Ok(Box::new(ProjectSource::new(project, sorted)?));
+                    }
+                }
+            }
+
             if let QueryOp::Scan(ScanData { table_id }) = project.underlying.as_ref() {
                 let table = find_table(ctx, table_id)?;
                 let required_columns = project
