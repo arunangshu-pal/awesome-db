@@ -1313,94 +1313,190 @@ fn sort_run(rows: &mut Vec<Row>, sort_specs: &[(usize, bool)]) {
 
 // ── Hash Join ────────────────────────────────────────────────────────────────
 
-/// Try to handle Filter(col=col) → Cross as a hash join.
-/// Returns Some(source) on success, None if no equi-join predicate found.
-fn try_hash_join(
+/// Collect all non-Cross leaf QueryOps from an arbitrarily deep left-linear cross chain.
+fn collect_cross_leaves<'a>(op: &'a QueryOp, out: &mut Vec<&'a QueryOp>) {
+    if let QueryOp::Cross(cross) = op {
+        collect_cross_leaves(&cross.left, out);
+        collect_cross_leaves(&cross.right, out);
+    } else {
+        out.push(op);
+    }
+}
+
+/// Execute Filter(Cross(...)) using a greedy N-way hash join with predicate pushdown.
+///
+/// Algorithm:
+///   1. Flatten the cross chain into N leaf ops.
+///   2. Execute + materialize each leaf.
+///   3. Push single-table predicates down: apply them immediately on each leaf's rows.
+///   4. Greedy hash join: while any leaf has an equi-join predicate with the accumulated
+///      result, hash-join it in (build on leaf, probe on accumulated).
+///   5. Any leaf still un-joined gets cross-producted in (expected to be tiny tables).
+///   6. Apply ALL filter predicates on the final result (idempotent, catches any missed).
+fn execute_filter_cross(
     filter: &FilterData,
     cross: &CrossData,
     ctx: &DbContext,
     disk_client: SharedDiskClient,
     scratch: &mut ScratchAllocator,
     memory_limit_mb: u64,
-) -> Result<Option<Box<dyn RowSource>>> {
-    // Execute both sides to discover their column schemas
-    let left_src = execute_query_op(
-        &cross.left, ctx, disk_client.clone(), scratch, memory_limit_mb,
-    )?;
-    let right_src = execute_query_op(
-        &cross.right, ctx, disk_client.clone(), scratch, memory_limit_mb,
-    )?;
+) -> Result<Box<dyn RowSource>> {
+    // 1. Flatten cross chain
+    let mut leaf_ops: Vec<&QueryOp> = Vec::new();
+    collect_cross_leaves(&cross.left, &mut leaf_ops);
+    collect_cross_leaves(&cross.right, &mut leaf_ops);
+    let n = leaf_ops.len();
 
-    let left_cols = left_src.columns().to_vec();
-    let right_cols = right_src.columns().to_vec();
+    // 2. Execute + materialize each leaf
+    let mut leaf_data: Vec<Option<(Vec<ColumnMeta>, Vec<Row>)>> = leaf_ops
+        .iter()
+        .map(|op| {
+            let rs = materialize_source(execute_query_op(
+                op, ctx, disk_client.clone(), scratch, memory_limit_mb,
+            )?)?;
+            Ok(Some((rs.columns, rs.rows)))
+        })
+        .collect::<Result<_>>()?;
 
-    let left_map: HashMap<&str, usize> = left_cols.iter().enumerate()
-        .map(|(i, c)| (c.name.as_str(), i)).collect();
-    let right_map: HashMap<&str, usize> = right_cols.iter().enumerate()
-        .map(|(i, c)| (c.name.as_str(), i)).collect();
-
-    // Find the first equi-join predicate (col_left = col_right or col_right = col_left)
-    let mut equi: Option<(usize, usize)> = None;  // (left_col_idx, right_col_idx)
-    let mut remaining: Vec<Predicate> = Vec::new();
-
-    for pred in &filter.predicates {
-        let found = if matches!(pred.operator, ComparisionOperator::EQ) {
-            if let ComparisionValue::Column(other) = &pred.value {
-                if let (Some(&li), Some(&ri)) = (left_map.get(pred.column_name.as_str()),
-                                                  right_map.get(other.as_str())) {
-                    equi.get_or_insert((li, ri)); true
-                } else if let (Some(&ri), Some(&li)) = (right_map.get(pred.column_name.as_str()),
-                                                          left_map.get(other.as_str())) {
-                    equi.get_or_insert((li, ri)); true
-                } else { false }
-            } else { false }
-        } else { false };
-        if !found { remaining.push(pred.clone()); }
-    }
-
-    let (left_key_idx, right_key_idx) = match equi {
-        None => return Ok(None),
-        Some(pair) => pair,
-    };
-
-    // Build phase: materialise the left side into a hash table
-    let left_result = materialize_source(left_src)?;
-    let mut hash_table: HashMap<DataKey, Vec<Row>> = HashMap::new();
-    for row in left_result.rows {
-        let key = DataKey(row.values[left_key_idx].clone());
-        hash_table.entry(key).or_default().push(row);
-    }
-
-    // Probe phase: stream the right side and emit matching pairs
-    let mut combined_cols: Vec<ColumnMeta> = left_cols.clone();
-    combined_cols.extend_from_slice(&right_cols);
-    let mut join_rows: Vec<Row> = Vec::new();
-    let mut right = right_src;
-    while let Some(rrow) = right.next_row()? {
-        let key = DataKey(rrow.values[right_key_idx].clone());
-        if let Some(lrows) = hash_table.get(&key) {
-            for lrow in lrows {
-                let mut values = lrow.values.clone();
-                values.extend_from_slice(&rrow.values);
-                join_rows.push(Row { values });
+    // 3. Build col_name → leaf_index map
+    let mut col_to_leaf: HashMap<String, usize> = HashMap::new();
+    for (li, opt) in leaf_data.iter().enumerate() {
+        if let Some((cols, _)) = opt {
+            for c in cols {
+                col_to_leaf.insert(c.name.clone(), li);
             }
         }
     }
 
-    let joined: Box<dyn RowSource> = Box::new(MaterializedSource::new(
-        ResultSet { columns: combined_cols, rows: join_rows },
-    ));
-
-    // Apply any remaining (non-equi-join) predicates
-    if remaining.is_empty() {
-        Ok(Some(joined))
-    } else {
-        let dummy_filter = FilterData {
-            predicates: remaining,
-            underlying: Box::new(QueryOp::Scan(ScanData { table_id: String::new() })),
+    // 4. Predicate pushdown: apply single-table predicates on each leaf
+    for li in 0..n {
+        let col_idx = {
+            let (cols, _) = leaf_data[li].as_ref().unwrap();
+            build_column_index(cols)
         };
-        Ok(Some(Box::new(FilterSource::new(&dummy_filter, joined))))
+        let (_, rows) = leaf_data[li].as_mut().unwrap();
+        rows.retain(|row| {
+            filter.predicates.iter().all(|pred| {
+                let left_leaf = col_to_leaf.get(&pred.column_name).copied();
+                let right_leaf = match &pred.value {
+                    ComparisionValue::Column(c) => col_to_leaf.get(c.as_str()).copied(),
+                    _ => None,
+                };
+                match (left_leaf, right_leaf) {
+                    (Some(ll), None) if ll == li =>
+                        predicate_matches(pred, row, &col_idx).unwrap_or(false),
+                    (Some(ll), Some(rl)) if ll == li && rl == li =>
+                        predicate_matches(pred, row, &col_idx).unwrap_or(false),
+                    _ => true,
+                }
+            })
+        });
     }
+
+    // 5. Greedy hash join
+    let (init_cols, init_rows) = leaf_data[0].take().unwrap();
+    let mut acc_cols: Vec<ColumnMeta> = init_cols;
+    let mut acc_rows: Vec<Row> = init_rows;
+    let mut joined = vec![false; n];
+    joined[0] = true;
+
+    let mut progress = true;
+    while progress {
+        progress = false;
+        'outer: for li in 0..n {
+            if joined[li] { continue; }
+            let (leaf_cols, leaf_rows) = leaf_data[li].as_ref().unwrap();
+
+            let acc_map: HashMap<&str, usize> = acc_cols.iter().enumerate()
+                .map(|(i, c)| (c.name.as_str(), i)).collect();
+            let leaf_map: HashMap<&str, usize> = leaf_cols.iter().enumerate()
+                .map(|(i, c)| (c.name.as_str(), i)).collect();
+
+            // Find first equi-join predicate between accumulated and leaf li
+            let mut join_keys: Option<(usize, usize)> = None;
+            for pred in &filter.predicates {
+                if !matches!(pred.operator, ComparisionOperator::EQ) { continue; }
+                if let ComparisionValue::Column(other) = &pred.value {
+                    if let (Some(&ai), Some(&li_idx)) = (
+                        acc_map.get(pred.column_name.as_str()),
+                        leaf_map.get(other.as_str()),
+                    ) {
+                        join_keys = Some((ai, li_idx));
+                        break;
+                    }
+                    if let (Some(&li_idx), Some(&ai)) = (
+                        leaf_map.get(pred.column_name.as_str()),
+                        acc_map.get(other.as_str()),
+                    ) {
+                        join_keys = Some((ai, li_idx));
+                        break;
+                    }
+                }
+            }
+
+            if let Some((acc_key, leaf_key)) = join_keys {
+                // Build hash table on leaf (smaller/next) side
+                let mut ht: HashMap<DataKey, Vec<Row>> = HashMap::new();
+                for row in leaf_rows {
+                    ht.entry(DataKey(row.values[leaf_key].clone()))
+                        .or_default()
+                        .push(row.clone());
+                }
+                // Probe with accumulated rows
+                let mut new_rows: Vec<Row> = Vec::new();
+                for acc_row in &acc_rows {
+                    let key = DataKey(acc_row.values[acc_key].clone());
+                    if let Some(matches) = ht.get(&key) {
+                        for leaf_row in matches {
+                            let mut values = acc_row.values.clone();
+                            values.extend_from_slice(&leaf_row.values);
+                            new_rows.push(Row { values });
+                        }
+                    }
+                }
+                let mut new_cols = acc_cols.clone();
+                new_cols.extend_from_slice(leaf_cols);
+                acc_rows = new_rows;
+                acc_cols = new_cols;
+                leaf_data[li] = None;
+                joined[li] = true;
+                progress = true;
+                break 'outer; // acc_cols changed — restart
+            }
+        }
+    }
+
+    // 6. Cross-product any unjoined leaves (no eq-join pred — should be tiny tables)
+    for li in 0..n {
+        if joined[li] { continue; }
+        let (leaf_cols, leaf_rows) = leaf_data[li].take().unwrap();
+        let mut new_rows =
+            Vec::with_capacity(acc_rows.len().saturating_mul(leaf_rows.len()));
+        for acc_row in &acc_rows {
+            for leaf_row in &leaf_rows {
+                let mut values = acc_row.values.clone();
+                values.extend_from_slice(&leaf_row.values);
+                new_rows.push(Row { values });
+            }
+        }
+        let mut new_cols = acc_cols.clone();
+        new_cols.extend(leaf_cols);
+        acc_rows = new_rows;
+        acc_cols = new_cols;
+    }
+
+    // 7. Apply ALL filter predicates on the final result (catches cross-table / non-equi)
+    let final_col_idx = build_column_index(&acc_cols);
+    acc_rows.retain(|row| {
+        filter.predicates.iter().all(|pred| {
+            predicate_matches(pred, row, &final_col_idx).unwrap_or(false)
+        })
+    });
+
+    Ok(Box::new(MaterializedSource::new(ResultSet {
+        columns: acc_cols,
+        rows: acc_rows,
+    })))
 }
 
 fn execute_query_op(
@@ -1416,16 +1512,13 @@ fn execute_query_op(
             Ok(Box::new(ScanSource::new(table, disk_client, None)?))
         }
         QueryOp::Filter(filter) => {
-            // Check for equi-join (Filter -> Cross) pattern
+            // Filter over a Cross chain → use N-way hash join with predicate pushdown
             if let QueryOp::Cross(cross) = filter.underlying.as_ref() {
-                if let Some(joined) = try_hash_join(
-                    filter, cross, ctx, disk_client.clone(), scratch, memory_limit_mb
-                )? {
-                    return Ok(joined);
-                }
+                return execute_filter_cross(
+                    filter, cross, ctx, disk_client, scratch, memory_limit_mb,
+                );
             }
-
-            let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch, memory_limit_mb)?;       //APal
+            let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch, memory_limit_mb)?;
             Ok(Box::new(FilterSource::new(filter, child)))
         }
         QueryOp::Project(project) => {
