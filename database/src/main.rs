@@ -3,7 +3,7 @@ use clap::Parser;
 use common::{
     Data, DataType,
     query::{
-        ComparisionOperator, ComparisionValue, FilterData, Predicate, ProjectData, Query,
+        ComparisionOperator, ComparisionValue, CrossData, FilterData, Predicate, ProjectData, Query,
         QueryOp, ScanData, SortData,
     },
 };
@@ -11,7 +11,8 @@ use db_config::{DbContext, table::TableSpec};
 use std::{
     cell::RefCell,
     cmp::Ordering,
-    collections::{HashMap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet},
+    hash::{Hash, Hasher},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     rc::Rc,
 };
@@ -109,6 +110,321 @@ impl DiskClient {
         self.writer.write_all(data)?;
         self.writer.flush()?;
         Ok(())
+    }
+}
+
+// ── Scratch-space row serialization ─────────────────────────────────────────
+
+/// Wrapper around Data that implements Hash + Eq for use as a HashMap key.
+struct DataKey(Data);
+
+impl Hash for DataKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match &self.0 {
+            Data::Int32(v)  => { 0u8.hash(state); v.hash(state); }
+            Data::Int64(v)  => { 1u8.hash(state); v.hash(state); }
+            Data::Float32(v) => { 2u8.hash(state); v.to_bits().hash(state); }
+            Data::Float64(v) => { 3u8.hash(state); v.to_bits().hash(state); }
+            Data::String(v) => { 4u8.hash(state); v.hash(state); }
+        }
+    }
+}
+
+impl PartialEq for DataKey {
+    fn eq(&self, other: &Self) -> bool { self.0 == other.0 }
+}
+impl Eq for DataKey {}
+
+/// Encode a single Data value into a byte buffer.
+/// Strings: 2-byte LE length prefix + raw UTF-8 bytes.
+fn encode_scratch_value(data: &Data, buf: &mut Vec<u8>) {
+    match data {
+        Data::Int32(v)  => buf.extend_from_slice(&v.to_le_bytes()),
+        Data::Int64(v)  => buf.extend_from_slice(&v.to_le_bytes()),
+        Data::Float32(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        Data::Float64(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        Data::String(s) => {
+            let bytes = s.as_bytes();
+            buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(bytes);
+        }
+    }
+}
+
+/// Exact encoded byte size for a Data value.
+fn scratch_value_size(data: &Data) -> usize {
+    match data {
+        Data::Int32(_)  => 4,
+        Data::Int64(_)  => 8,
+        Data::Float32(_) => 4,
+        Data::Float64(_) => 8,
+        Data::String(s) => 2 + s.len(),
+    }
+}
+
+/// Realistic in-memory per-row size estimate covering Vecs and Enums.
+fn scratch_row_size_estimate(schema: &[DataType]) -> usize {
+    // True memory overhead in Rust per row:
+    // Row struct = 24 bytes (for Vec<Data>)
+    // Vec allocation: schema.len() * 32 bytes
+    let mut size = 24 + schema.len() * 32;
+
+    for dt in schema {
+        if matches!(dt, DataType::String) {
+            size += 64; // conservative average string payload overhead on heap
+        }
+    }
+    size.max(1)
+}
+
+/// Decode one Data value from a byte slice at *offset (advances offset).
+fn decode_scratch_value(dtype: &DataType, buf: &[u8], offset: &mut usize) -> Result<Data> {
+    match dtype {
+        DataType::Int32 => {
+            let b: [u8; 4] = buf[*offset..*offset+4].try_into()
+                .map_err(|_| anyhow!("scratch Int32 OOB"))?;
+            *offset += 4;
+            Ok(Data::Int32(i32::from_le_bytes(b)))
+        }
+        DataType::Int64 => {
+            let b: [u8; 8] = buf[*offset..*offset+8].try_into()
+                .map_err(|_| anyhow!("scratch Int64 OOB"))?;
+            *offset += 8;
+            Ok(Data::Int64(i64::from_le_bytes(b)))
+        }
+        DataType::Float32 => {
+            let b: [u8; 4] = buf[*offset..*offset+4].try_into()
+                .map_err(|_| anyhow!("scratch Float32 OOB"))?;
+            *offset += 4;
+            Ok(Data::Float32(f32::from_le_bytes(b)))
+        }
+        DataType::Float64 => {
+            let b: [u8; 8] = buf[*offset..*offset+8].try_into()
+                .map_err(|_| anyhow!("scratch Float64 OOB"))?;
+            *offset += 8;
+            Ok(Data::Float64(f64::from_le_bytes(b)))
+        }
+        DataType::String => {
+            let len_b: [u8; 2] = buf[*offset..*offset+2].try_into()
+                .map_err(|_| anyhow!("scratch String len OOB"))?;
+            let len = u16::from_le_bytes(len_b) as usize;
+            *offset += 2;
+            let s = String::from_utf8(buf[*offset..*offset+len].to_vec())
+                .context("scratch String UTF-8")?;
+            *offset += len;
+            Ok(Data::String(s))
+        }
+    }
+}
+
+/// Pack rows into scratch blocks (each block_size bytes, last 2 bytes = u16 row count LE).
+/// Returns a Vec<u8> whose length is a multiple of block_size.
+fn encode_rows_to_scratch_blocks(rows: &[Row], _schema: &[DataType], block_size: usize) -> Vec<u8> {
+    let mut all = Vec::new();
+    let mut block = vec![0u8; block_size];
+    let mut offset = 0usize;
+    let mut count = 0u16;
+
+    for row in rows {
+        // Encode the row into a temporary buffer
+        let mut rbuf = Vec::new();
+        for val in &row.values {
+            encode_scratch_value(val, &mut rbuf);
+        }
+        if rbuf.len() > block_size - 2 {
+            // Row too large for any block — skip (should not happen with TPCH data)
+            continue;
+        }
+        if offset + rbuf.len() > block_size - 2 {
+            // Flush current block
+            let cb = count.to_le_bytes();
+            block[block_size - 2] = cb[0];
+            block[block_size - 1] = cb[1];
+            all.extend_from_slice(&block);
+            block = vec![0u8; block_size];
+            offset = 0;
+            count = 0;
+        }
+        block[offset..offset + rbuf.len()].copy_from_slice(&rbuf);
+        offset += rbuf.len();
+        count += 1;
+    }
+    // Flush last block (may be empty if rows was empty)
+    let cb = count.to_le_bytes();
+    block[block_size - 2] = cb[0];
+    block[block_size - 1] = cb[1];
+    all.extend_from_slice(&block);
+    all
+}
+
+/// Decode all rows from one scratch block.
+fn decode_scratch_block(block: &[u8], schema: &[DataType]) -> Result<Vec<Row>> {
+    let bsize = block.len();
+    let row_count = u16::from_le_bytes([block[bsize - 2], block[bsize - 1]]) as usize;
+    let payload = &block[..bsize - 2];
+    let mut offset = 0usize;
+    let mut rows = Vec::with_capacity(row_count);
+    for _ in 0..row_count {
+        let mut values = Vec::with_capacity(schema.len());
+        for dtype in schema {
+            values.push(decode_scratch_value(dtype, payload, &mut offset)?);
+        }
+        rows.push(Row { values });
+    }
+    Ok(rows)
+}
+
+/// Write a sorted run to scratch, return its location metadata.
+fn write_run_to_scratch(
+    rows: &[Row],
+    schema: &[DataType],
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+) -> Result<ScratchRunMeta> {
+    let block_size = disk_client.borrow().block_size;
+    let data = encode_rows_to_scratch_blocks(rows, schema, block_size);
+    let num_blocks = (data.len() / block_size) as u64;
+    let start_block = scratch.alloc(num_blocks);
+    disk_client.borrow_mut().put_blocks(start_block, &data)?;
+    Ok(ScratchRunMeta { start_block, num_blocks })
+}
+
+/// Metadata for one sorted run stored in scratch space.
+struct ScratchRunMeta {
+    start_block: u64,
+    num_blocks: u64,
+}
+
+/// Per-run cursor state for k-way merge.
+struct RunState {
+    block_offset: u64,
+    rows_buffer: Vec<Row>,
+    row_idx: usize,
+}
+
+/// Heap entry for k-way merge; wrapped in Reverse so BinaryHeap acts as min-heap.
+struct HeapEntry {
+    key_values: Vec<Data>,
+    ascending: Vec<bool>,
+    run_idx: usize,
+    row: Row,
+}
+
+impl HeapEntry {
+    fn cmp_key(&self, other: &Self) -> Ordering {
+        for i in 0..self.key_values.len() {
+            let ord = self.key_values[i]
+                .partial_cmp(&other.key_values[i])
+                .unwrap_or(Ordering::Equal);
+            let ord = if self.ascending[i] { ord } else { ord.reverse() };
+            if ord != Ordering::Equal { return ord; }
+        }
+        self.run_idx.cmp(&other.run_idx)
+    }
+}
+impl PartialEq for HeapEntry {
+    fn eq(&self, other: &Self) -> bool { self.cmp_key(other) == Ordering::Equal }
+}
+impl Eq for HeapEntry {}
+impl PartialOrd for HeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for HeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering { self.cmp_key(other) }
+}
+
+/// A RowSource that k-way merges multiple sorted scratch runs.
+struct MergeSortSource {
+    columns: Vec<ColumnMeta>,
+    schema: Vec<DataType>,
+    sort_col_indices: Vec<usize>,
+    ascending: Vec<bool>,
+    runs: Vec<ScratchRunMeta>,
+    run_states: Vec<RunState>,
+    disk_client: SharedDiskClient,
+    block_size: usize,
+    heap: BinaryHeap<std::cmp::Reverse<HeapEntry>>,
+}
+
+impl MergeSortSource {
+    fn new(
+        columns: Vec<ColumnMeta>,
+        schema: Vec<DataType>,
+        sort_col_indices: Vec<usize>,
+        ascending: Vec<bool>,
+        runs: Vec<ScratchRunMeta>,
+        disk_client: SharedDiskClient,
+        block_size: usize,
+    ) -> Result<Self> {
+        let mut run_states: Vec<RunState> = runs.iter().map(|_| RunState {
+            block_offset: 0,
+            rows_buffer: Vec::new(),
+            row_idx: 0,
+        }).collect();
+
+        let mut heap = BinaryHeap::new();
+        for run_idx in 0..runs.len() {
+            if let Some(row) = Self::pull_next(
+                run_idx, &runs, &mut run_states[run_idx], &schema, &disk_client, block_size,
+            )? {
+                let key_values: Vec<Data> = sort_col_indices.iter()
+                    .map(|&i| row.values[i].clone()).collect();
+                heap.push(std::cmp::Reverse(HeapEntry {
+                    key_values, ascending: ascending.clone(), run_idx, row,
+                }));
+            }
+        }
+
+        Ok(Self { columns, schema, sort_col_indices, ascending, runs, run_states,
+                  disk_client, block_size, heap })
+    }
+
+    fn pull_next(
+        run_idx: usize,
+        runs: &[ScratchRunMeta],
+        state: &mut RunState,
+        schema: &[DataType],
+        disk_client: &SharedDiskClient,
+        _block_size: usize,
+    ) -> Result<Option<Row>> {
+        if state.row_idx < state.rows_buffer.len() {
+            let row = state.rows_buffer[state.row_idx].clone();
+            state.row_idx += 1;
+            return Ok(Some(row));
+        }
+        let run = &runs[run_idx];
+        if state.block_offset >= run.num_blocks { return Ok(None); }
+        let block_data = disk_client.borrow_mut()
+            .get_blocks(run.start_block + state.block_offset, 1)?;
+        state.block_offset += 1;
+        state.rows_buffer = decode_scratch_block(&block_data, schema)?;
+        state.row_idx = 0;
+        if state.rows_buffer.is_empty() { return Ok(None); }
+        let row = state.rows_buffer[state.row_idx].clone();
+        state.row_idx += 1;
+        Ok(Some(row))
+    }
+}
+
+impl RowSource for MergeSortSource {
+    fn columns(&self) -> &[ColumnMeta] { &self.columns }
+
+    fn next_row(&mut self) -> Result<Option<Row>> {
+        let Some(std::cmp::Reverse(entry)) = self.heap.pop() else {
+            return Ok(None);
+        };
+        let run_idx = entry.run_idx;
+        if let Some(next_row) = Self::pull_next(
+            run_idx, &self.runs, &mut self.run_states[run_idx],
+            &self.schema, &self.disk_client, self.block_size,
+        )? {
+            let key_values: Vec<Data> = self.sort_col_indices.iter()
+                .map(|&i| next_row.values[i].clone()).collect();
+            self.heap.push(std::cmp::Reverse(HeapEntry {
+                key_values, ascending: self.ascending.clone(), run_idx, row: next_row,
+            }));
+        }
+        Ok(Some(entry.row))
     }
 }
 
@@ -914,11 +1230,185 @@ fn materialize_source(mut source: Box<dyn RowSource>) -> Result<ResultSet> {
     Ok(ResultSet { columns, rows })
 }
 
+// ── External Merge Sort ───────────────────────────────────────────────────────
+
+/// Sort `source` using disk scratch for runs that exceed memory_limit_mb / 2.
+fn external_sort(
+    sort: &SortData,
+    source: Box<dyn RowSource>,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<Box<dyn RowSource>> {
+    let columns = source.columns().to_vec();
+    let schema: Vec<DataType> = columns.iter().map(|c| c.data_type.clone()).collect();
+
+    // Compile sort specs to column indices once
+    let col_idx = build_column_index(&columns);
+    let sort_specs: Vec<(usize, bool)> = sort.sort_specs.iter().map(|s| {
+        let i = *col_idx.get(s.column_name.as_str())
+            .ok_or_else(|| anyhow!("Unknown sort column {}", s.column_name))?;
+        Ok((i, s.ascending))
+    }).collect::<Result<_>>()?;
+    let sort_col_indices: Vec<usize> = sort_specs.iter().map(|(i, _)| *i).collect();
+    let ascending: Vec<bool> = sort_specs.iter().map(|(_, a)| *a).collect();
+
+    // Memory budget: use half the limit for in-memory runs
+    let row_est = scratch_row_size_estimate(&schema);
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 2) as usize;
+    let run_capacity = (budget_bytes / row_est).max(1024);
+
+    let block_size = disk_client.borrow().block_size;
+    let mut runs: Vec<ScratchRunMeta> = Vec::new();
+    let mut current_run: Vec<Row> = Vec::with_capacity(run_capacity);
+    let mut source = source;
+
+    loop {
+        match source.next_row()? {
+            None => break,
+            Some(row) => {
+                current_run.push(row);
+                if current_run.len() >= run_capacity {
+                    sort_run(&mut current_run, &sort_specs);
+                    let meta = write_run_to_scratch(
+                        &current_run, &schema, disk_client.clone(), scratch,
+                    )?;
+                    runs.push(meta);
+                    current_run.clear();
+                }
+            }
+        }
+    }
+
+    // Sort the last (possibly only) run
+    if !current_run.is_empty() {
+        sort_run(&mut current_run, &sort_specs);
+        if runs.is_empty() {
+            // Fast path: everything fit in memory — no scratch I/O needed
+            return Ok(Box::new(MaterializedSource::new(ResultSet { columns, rows: current_run })));
+        }
+        let meta = write_run_to_scratch(&current_run, &schema, disk_client.clone(), scratch)?;
+        runs.push(meta);
+    }
+
+    if runs.is_empty() {
+        return Ok(Box::new(MaterializedSource::new(ResultSet { columns, rows: vec![] })));
+    }
+
+    Ok(Box::new(MergeSortSource::new(
+        columns, schema, sort_col_indices, ascending, runs, disk_client, block_size,
+    )?))
+}
+
+fn sort_run(rows: &mut Vec<Row>, sort_specs: &[(usize, bool)]) {
+    rows.sort_by(|a, b| {
+        for (idx, ascending) in sort_specs {
+            let ord = a.values[*idx].partial_cmp(&b.values[*idx]).unwrap_or(Ordering::Equal);
+            let ord = if *ascending { ord } else { ord.reverse() };
+            if ord != Ordering::Equal { return ord; }
+        }
+        Ordering::Equal
+    });
+}
+
+// ── Hash Join ────────────────────────────────────────────────────────────────
+
+/// Try to handle Filter(col=col) → Cross as a hash join.
+/// Returns Some(source) on success, None if no equi-join predicate found.
+fn try_hash_join(
+    filter: &FilterData,
+    cross: &CrossData,
+    ctx: &DbContext,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<Option<Box<dyn RowSource>>> {
+    // Execute both sides to discover their column schemas
+    let left_src = execute_query_op(
+        &cross.left, ctx, disk_client.clone(), scratch, memory_limit_mb,
+    )?;
+    let right_src = execute_query_op(
+        &cross.right, ctx, disk_client.clone(), scratch, memory_limit_mb,
+    )?;
+
+    let left_cols = left_src.columns().to_vec();
+    let right_cols = right_src.columns().to_vec();
+
+    let left_map: HashMap<&str, usize> = left_cols.iter().enumerate()
+        .map(|(i, c)| (c.name.as_str(), i)).collect();
+    let right_map: HashMap<&str, usize> = right_cols.iter().enumerate()
+        .map(|(i, c)| (c.name.as_str(), i)).collect();
+
+    // Find the first equi-join predicate (col_left = col_right or col_right = col_left)
+    let mut equi: Option<(usize, usize)> = None;  // (left_col_idx, right_col_idx)
+    let mut remaining: Vec<Predicate> = Vec::new();
+
+    for pred in &filter.predicates {
+        let found = if matches!(pred.operator, ComparisionOperator::EQ) {
+            if let ComparisionValue::Column(other) = &pred.value {
+                if let (Some(&li), Some(&ri)) = (left_map.get(pred.column_name.as_str()),
+                                                  right_map.get(other.as_str())) {
+                    equi.get_or_insert((li, ri)); true
+                } else if let (Some(&ri), Some(&li)) = (right_map.get(pred.column_name.as_str()),
+                                                          left_map.get(other.as_str())) {
+                    equi.get_or_insert((li, ri)); true
+                } else { false }
+            } else { false }
+        } else { false };
+        if !found { remaining.push(pred.clone()); }
+    }
+
+    let (left_key_idx, right_key_idx) = match equi {
+        None => return Ok(None),
+        Some(pair) => pair,
+    };
+
+    // Build phase: materialise the left side into a hash table
+    let left_result = materialize_source(left_src)?;
+    let mut hash_table: HashMap<DataKey, Vec<Row>> = HashMap::new();
+    for row in left_result.rows {
+        let key = DataKey(row.values[left_key_idx].clone());
+        hash_table.entry(key).or_default().push(row);
+    }
+
+    // Probe phase: stream the right side and emit matching pairs
+    let mut combined_cols: Vec<ColumnMeta> = left_cols.clone();
+    combined_cols.extend_from_slice(&right_cols);
+    let mut join_rows: Vec<Row> = Vec::new();
+    let mut right = right_src;
+    while let Some(rrow) = right.next_row()? {
+        let key = DataKey(rrow.values[right_key_idx].clone());
+        if let Some(lrows) = hash_table.get(&key) {
+            for lrow in lrows {
+                let mut values = lrow.values.clone();
+                values.extend_from_slice(&rrow.values);
+                join_rows.push(Row { values });
+            }
+        }
+    }
+
+    let joined: Box<dyn RowSource> = Box::new(MaterializedSource::new(
+        ResultSet { columns: combined_cols, rows: join_rows },
+    ));
+
+    // Apply any remaining (non-equi-join) predicates
+    if remaining.is_empty() {
+        Ok(Some(joined))
+    } else {
+        let dummy_filter = FilterData {
+            predicates: remaining,
+            underlying: Box::new(QueryOp::Scan(ScanData { table_id: String::new() })),
+        };
+        Ok(Some(Box::new(FilterSource::new(&dummy_filter, joined))))
+    }
+}
+
 fn execute_query_op(
     query_op: &QueryOp,
     ctx: &DbContext,
     disk_client: SharedDiskClient,
     scratch: &mut ScratchAllocator,                 //APal
+    memory_limit_mb: u64,
 ) -> Result<Box<dyn RowSource>> {
     match query_op {
         QueryOp::Scan(ScanData { table_id }) => {
@@ -926,7 +1416,16 @@ fn execute_query_op(
             Ok(Box::new(ScanSource::new(table, disk_client, None)?))
         }
         QueryOp::Filter(filter) => {
-            let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch)?;       //APal
+            // Check for equi-join (Filter -> Cross) pattern
+            if let QueryOp::Cross(cross) = filter.underlying.as_ref() {
+                if let Some(joined) = try_hash_join(
+                    filter, cross, ctx, disk_client.clone(), scratch, memory_limit_mb
+                )? {
+                    return Ok(joined);
+                }
+            }
+
+            let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch, memory_limit_mb)?;       //APal
             Ok(Box::new(FilterSource::new(filter, child)))
         }
         QueryOp::Project(project) => {
@@ -958,18 +1457,16 @@ fn execute_query_op(
                 }
             }
 
-            let child = execute_query_op(&project.underlying, ctx, disk_client, scratch)?;      //APal
+            let child = execute_query_op(&project.underlying, ctx, disk_client, scratch, memory_limit_mb)?;      //APal
             Ok(Box::new(ProjectSource::new(project, child)?))
         }
         QueryOp::Sort(sort) => {
-            let child = execute_query_op(&sort.underlying, ctx, disk_client, scratch)?;         //APal
-            let mut result = materialize_source(child)?;
-            sort_rows(sort, &mut result.rows, &result.columns)?;
-            Ok(Box::new(MaterializedSource::new(result)))
+            let child = execute_query_op(&sort.underlying, ctx, disk_client.clone(), scratch, memory_limit_mb)?;         //APal
+            external_sort(sort, child, disk_client, scratch, memory_limit_mb)
         }
         QueryOp::Cross(cross) => {
-            let left = materialize_source(execute_query_op(&cross.left, ctx, disk_client.clone(), scratch)?)?;      //APal
-            let right = materialize_source(execute_query_op(&cross.right, ctx, disk_client, scratch)?)?;            //APal
+            let left = materialize_source(execute_query_op(&cross.left, ctx, disk_client.clone(), scratch, memory_limit_mb)?)?;      //APal
+            let right = materialize_source(execute_query_op(&cross.right, ctx, disk_client, scratch, memory_limit_mb)?)?;            //APal
             Ok(Box::new(MaterializedSource::new(execute_cross(left, right))))
         }
     }
@@ -1034,7 +1531,7 @@ fn db_main() -> Result<()> {
     let mut scratch = ScratchAllocator::new(anon_start, block_size);    //APal
 
     let query = read_query(&mut monitor_reader)?;
-    let _memory_limit_mb = request_memory_limit(&mut monitor_reader, &mut monitor_writer)?;
+    let memory_limit_mb = request_memory_limit(&mut monitor_reader, &mut monitor_writer)?;
 
     if let QueryOp::Project(project) = &query.root {
         if let QueryOp::Filter(filter) = project.underlying.as_ref() {
@@ -1051,7 +1548,7 @@ fn db_main() -> Result<()> {
         }
     }
 
-    let result_source = execute_query_op(&query.root, &ctx, disk_client, &mut scratch)?;        //APal
+    let result_source = execute_query_op(&query.root, &ctx, disk_client, &mut scratch, memory_limit_mb)?;        //APal
     write_result_to_monitor(result_source, &mut monitor_writer)?;
 
     Ok(())
