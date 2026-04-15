@@ -2166,9 +2166,7 @@ fn join_leaves_to_scratch(
             continue;
         }
 
-        let left_part =
-            load_scratch_runs(&left_parts[p], &left_leaf.schema, disk_client.clone(), block_size)?;
-        if left_part.is_empty() {
+        if left_parts[p].is_empty() {
             continue;
         }
 
@@ -2179,7 +2177,14 @@ fn join_leaves_to_scratch(
                 .push(row);
         }
 
-        for left_row in &left_part {
+        let mut left_src = ScratchRunsSource::new(
+            left_leaf.columns.clone(),
+            left_leaf.schema.clone(),
+            left_parts[p].clone(),
+            disk_client.clone(),
+        );
+
+        while let Some(left_row) = left_src.next_row()? {
             let key = DataKey(left_row.values[left_key].clone());
             if let Some(matches) = ht.get(&key) {
                 for right_row in matches {
@@ -2366,18 +2371,17 @@ fn streaming_grace_hash_join(
         }).sum::<usize>() + 24
     }).sum();
     let avg_row_bytes = if sample.is_empty() { 64 } else { sample_bytes / sample.len() };
-    // Conservative total estimate: assume right table ~ sample_size * 1000 rows if we
-    // hit the sample limit, otherwise just sample.len() rows total.
-    let est_total = if sample.len() < SAMPLE_SIZE {
-        sample.len() * avg_row_bytes
+    let num_partitions = if sample.len() < SAMPLE_SIZE {
+        let est_total = sample.len() * avg_row_bytes;
+        if est_total <= budget_bytes {
+            1usize
+        } else {
+            ((est_total / budget_bytes) + 1).max(2).min(256)
+        }
     } else {
-        sample.len() * avg_row_bytes * 1000 // very conservative upper bound
-    };
-
-    let num_partitions = if est_total <= budget_bytes {
-        1usize
-    } else {
-        ((est_total / budget_bytes) + 1).max(2).min(256)
+        // Stream limit hit: dataset could be massive.
+        // Pre-allocate many partitions conservatively.
+        256usize
     };
 
     let block_size = disk_client.borrow().block_size;
