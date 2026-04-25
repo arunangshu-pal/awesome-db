@@ -50,9 +50,9 @@ trait RowSource {
 }
 
 type SharedDiskClient = Rc<RefCell<DiskClient>>;
-const SCAN_BATCH_BLOCKS: u64 = 64;
+const SCAN_BATCH_BLOCKS: u64 = 128;
 const SCRATCH_PREFETCH_BLOCKS: u64 = 32;
-const SCRATCH_WRITE_BUF: usize = 1024;
+const SCRATCH_WRITE_BUF: usize = 2048;
 
 struct DiskClient {
     reader: BufReader<Box<dyn Read>>,
@@ -1911,7 +1911,7 @@ fn grace_hash_join(
     memory_limit_mb: u64,
 ) -> Result<Vec<Row>> {
     // Budget = 1/3 of memory limit for the build-side hash table of one partition.
-    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 4) as usize;
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
 
     // Estimate right (build) side memory.
     // Simple heuristic: count bytes in encoded form (8 bytes per numeric, string len).
@@ -2046,7 +2046,7 @@ fn materialize_filtered_source_to_scratch(
 ) -> Result<MaterializedLeaf> {
     let columns = source.columns().to_vec();
     let schema: Vec<DataType> = columns.iter().map(|column| column.data_type.clone()).collect();
-    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 6) as usize)
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 4) as usize)
         / scratch_row_size_estimate(&schema))
         .clamp(256, 16384);
 
@@ -2176,7 +2176,7 @@ fn join_leaves_to_scratch(
     scratch: &mut ScratchAllocator,
     memory_limit_mb: u64,
 ) -> Result<MaterializedLeaf> {
-    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 4) as usize;
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
     let right_est = right_leaf.row_count
         .saturating_mul(scratch_row_size_estimate(&right_leaf.schema));
     let num_partitions = if right_est <= budget_bytes {
@@ -2331,7 +2331,7 @@ fn rewrite_leaf_to_scratch(
         .iter()
         .map(|column| column.data_type.clone())
         .collect();
-    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 6) as usize)
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 4) as usize)
         / scratch_row_size_estimate(&schema))
         .clamp(256, 16384);
     let current_col_idx = build_column_index(&leaf.columns);
@@ -2427,7 +2427,7 @@ fn streaming_grace_hash_join(
     memory_limit_mb: u64,
 ) -> Result<Vec<Row>> {
     // Budget = 1/3 of memory limit for a single partition's hash table.
-    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 4) as usize;
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
 
     // Decide partition count based on a rough right-side size estimate.
     // We peek at up to 1024 rows to estimate avg row size, keeping them buffered.
@@ -2689,6 +2689,26 @@ fn execute_query_op(
             Ok(Box::new(ProjectSource::new(project, child)?))
         }
         QueryOp::Sort(sort) => {
+            // Sort(Filter(Scan)) — prune to sort + filter columns
+            if let QueryOp::Filter(filter) = sort.underlying.as_ref() {
+                if let QueryOp::Scan(ScanData { table_id }) = filter.underlying.as_ref() {
+                    let table = find_table(ctx, table_id)?;
+                    let mut required_columns = HashSet::new();
+                    collect_required_columns_for_sort(sort, &mut required_columns);
+                    collect_required_columns_for_filter(filter, &mut required_columns);
+                    let scan = ScanSource::new(table, disk_client.clone(), Some(&required_columns))?;
+                    let filtered: Box<dyn RowSource> = Box::new(FilterSource::new(filter, Box::new(scan)));
+                    return external_sort(sort, filtered, disk_client, scratch, memory_limit_mb);
+                }
+            }
+            // Sort(Scan) — prune to sort columns only
+            if let QueryOp::Scan(ScanData { table_id }) = sort.underlying.as_ref() {
+                let table = find_table(ctx, table_id)?;
+                let mut required_columns = HashSet::new();
+                collect_required_columns_for_sort(sort, &mut required_columns);
+                let scan = ScanSource::new(table, disk_client.clone(), Some(&required_columns))?;
+                return external_sort(sort, Box::new(scan), disk_client, scratch, memory_limit_mb);
+            }
             let child = execute_query_op(&sort.underlying, ctx, disk_client.clone(), scratch, memory_limit_mb)?;         //APal
             external_sort(sort, child, disk_client, scratch, memory_limit_mb)
         }
