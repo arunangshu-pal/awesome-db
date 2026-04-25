@@ -51,6 +51,8 @@ trait RowSource {
 
 type SharedDiskClient = Rc<RefCell<DiskClient>>;
 const SCAN_BATCH_BLOCKS: u64 = 128;
+const SCRATCH_PREFETCH_BLOCKS: u64 = 32;
+const SCRATCH_WRITE_BUF: usize = 2048;
 
 struct DiskClient {
     reader: BufReader<Box<dyn Read>>,
@@ -386,7 +388,7 @@ impl MergeSortSource {
         state: &mut RunState,
         schema: &[DataType],
         disk_client: &SharedDiskClient,
-        _block_size: usize,
+        block_size: usize,
     ) -> Result<Option<Row>> {
         if state.row_idx < state.rows_buffer.len() {
             let row = state.rows_buffer[state.row_idx].clone();
@@ -395,10 +397,18 @@ impl MergeSortSource {
         }
         let run = &runs[run_idx];
         if state.block_offset >= run.num_blocks { return Ok(None); }
-        let block_data = disk_client.borrow_mut()
-            .get_blocks(run.start_block + state.block_offset, 1)?;
-        state.block_offset += 1;
-        state.rows_buffer = decode_scratch_block(&block_data, schema)?;
+        // Batch-prefetch multiple blocks at once to reduce rotational latency
+        let remaining = run.num_blocks - state.block_offset;
+        let fetch_count = remaining.min(SCRATCH_PREFETCH_BLOCKS);
+        let batch_data = disk_client.borrow_mut()
+            .get_blocks(run.start_block + state.block_offset, fetch_count)?;
+        state.block_offset += fetch_count;
+        // Decode all fetched blocks into the buffer
+        let mut all_rows = Vec::new();
+        for block in batch_data.chunks_exact(block_size) {
+            all_rows.extend(decode_scratch_block(block, schema)?);
+        }
+        state.rows_buffer = all_rows;
         state.row_idx = 0;
         if state.rows_buffer.is_empty() { return Ok(None); }
         let row = state.rows_buffer[state.row_idx].clone();
@@ -504,12 +514,20 @@ impl RowSource for ScratchRunsSource {
                 continue;
             }
 
-            let block = self
+            // Batch-prefetch multiple blocks to reduce I/O operations
+            let remaining = run.num_blocks - self.current_block_offset;
+            let fetch_count = remaining.min(SCRATCH_PREFETCH_BLOCKS);
+            let batch = self
                 .disk_client
                 .borrow_mut()
-                .get_blocks(run.start_block + self.current_block_offset, 1)?;
-            self.current_block_offset += 1;
-            self.current_rows = decode_scratch_block(&block, &self.schema)?.into_iter();
+                .get_blocks(run.start_block + self.current_block_offset, fetch_count)?;
+            self.current_block_offset += fetch_count;
+            let block_size = self.disk_client.borrow().block_size;
+            let mut all_rows = Vec::new();
+            for block in batch.chunks_exact(block_size) {
+                all_rows.extend(decode_scratch_block(block, &self.schema)?);
+            }
+            self.current_rows = all_rows.into_iter();
         }
     }
 }
@@ -1410,6 +1428,43 @@ fn execute_cross(left: ResultSet, right: ResultSet) -> ResultSet {
     ResultSet { columns, rows }
 }
 
+fn out_of_core_cross(
+    left_src: Box<dyn RowSource>,
+    right_src: Box<dyn RowSource>,
+    disk_client: SharedDiskClient,
+    scratch: &mut ScratchAllocator,
+    memory_limit_mb: u64,
+) -> Result<Box<dyn RowSource>> {
+    let left_leaf = materialize_filtered_source_to_scratch(left_src, &[], disk_client.clone(), scratch, memory_limit_mb)?;
+    let right_leaf = materialize_filtered_source_to_scratch(right_src, &[], disk_client.clone(), scratch, memory_limit_mb)?;
+    
+    let mut output_columns = left_leaf.columns.clone();
+    output_columns.extend(right_leaf.columns.clone());
+    let output_schema: Vec<DataType> = output_columns.iter().map(|c| c.data_type.clone()).collect();
+    
+    let mut out_buf: Vec<Row> = Vec::with_capacity(SCRATCH_WRITE_BUF);
+    let mut runs = Vec::new();
+    
+    let mut left_stream = make_leaf_source(&left_leaf, disk_client.clone());
+    while let Some(left_row) = left_stream.next_row()? {
+        let mut right_stream = make_leaf_source(&right_leaf, disk_client.clone());
+        while let Some(right_row) = right_stream.next_row()? {
+            let mut values = left_row.values.clone();
+            values.extend_from_slice(&right_row.values);
+            out_buf.push(Row { values });
+            if out_buf.len() >= SCRATCH_WRITE_BUF {
+                runs.push(write_run_to_scratch(&out_buf, &output_schema, disk_client.clone(), scratch)?);
+                out_buf.clear();
+            }
+        }
+    }
+    if !out_buf.is_empty() {
+        runs.push(write_run_to_scratch(&out_buf, &output_schema, disk_client.clone(), scratch)?);
+    }
+    
+    Ok(Box::new(ScratchRunsSource::new(output_columns, output_schema, runs, disk_client)))
+}
+
 fn materialize_source(mut source: Box<dyn RowSource>) -> Result<ResultSet> {
     let columns = source.columns().to_vec();
     let mut rows = Vec::new();
@@ -1444,10 +1499,10 @@ fn external_sort(
     let sort_col_indices: Vec<usize> = sort_specs.iter().map(|(i, _)| *i).collect();
     let ascending: Vec<bool> = sort_specs.iter().map(|(_, a)| *a).collect();
 
-    // Memory budget: use half the limit for in-memory runs
+    // Memory budget: use 3/4 of the limit for in-memory runs (runs written to scratch then freed)
     let row_est = scratch_row_size_estimate(&schema);
-    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 2) as usize;
-    let run_capacity = (budget_bytes / row_est).clamp(256, 4096);
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) * 3 / 4) as usize;
+    let run_capacity = (budget_bytes / row_est).clamp(256, 32768);
 
     let block_size = disk_client.borrow().block_size;
     let mut runs: Vec<ScratchRunMeta> = Vec::new();
@@ -1771,37 +1826,36 @@ fn execute_filter_cross(
     // 5. Cross-product any unjoined leaves (no eq-join pred — expected tiny tables)
     for li in 0..n {
         if joined[li] { continue; }
-        let acc_rows = load_scratch_runs(
-            &acc_leaf.runs,
-            &acc_leaf.schema,
-            disk_client.clone(),
-            block_size,
-        )?;
-        let leaf_rows = load_scratch_runs(
-            &leaf_materialized[li].runs,
-            &leaf_materialized[li].schema,
-            disk_client.clone(),
-            block_size,
-        )?;
-        let mut new_rows = Vec::with_capacity(acc_rows.len().saturating_mul(leaf_rows.len()));
-        for acc_row in &acc_rows {
-            for leaf_row in &leaf_rows {
-                let mut values = acc_row.values.clone();
-                values.extend_from_slice(&leaf_row.values);
-                new_rows.push(Row { values });
-            }
-        }
+        
         let mut new_cols = acc_leaf.columns.clone();
         new_cols.extend(leaf_materialized[li].columns.clone());
+        let schema: Vec<DataType> = new_cols.iter().map(|c| c.data_type.clone()).collect();
+        
+        let mut runs = Vec::new();
+        let mut out_buf: Vec<Row> = Vec::with_capacity(SCRATCH_WRITE_BUF);
+        
+        let mut acc_stream = make_leaf_source(&acc_leaf, disk_client.clone());
+        while let Some(acc_row) = acc_stream.next_row()? {
+            let mut leaf_stream = make_leaf_source(&leaf_materialized[li], disk_client.clone());
+            while let Some(leaf_row) = leaf_stream.next_row()? {
+                let mut values = acc_row.values.clone();
+                values.extend_from_slice(&leaf_row.values);
+                out_buf.push(Row { values });
+                if out_buf.len() >= SCRATCH_WRITE_BUF {
+                    runs.push(write_run_to_scratch(&out_buf, &schema, disk_client.clone(), scratch)?);
+                    out_buf.clear();
+                }
+            }
+        }
+        if !out_buf.is_empty() {
+            runs.push(write_run_to_scratch(&out_buf, &schema, disk_client.clone(), scratch)?);
+        }
+
         let tmp_leaf = MaterializedLeaf {
             columns: new_cols.clone(),
-            schema: new_cols.iter().map(|c| c.data_type.clone()).collect(),
-            runs: {
-                let schema: Vec<DataType> = new_cols.iter().map(|c| c.data_type.clone()).collect();
-                let meta = write_run_to_scratch(&new_rows, &schema, disk_client.clone(), scratch)?;
-                vec![meta]
-            },
-            row_count: new_rows.len(),
+            schema,
+            runs,
+            row_count: acc_leaf.row_count.saturating_mul(leaf_materialized[li].row_count),
         };
         joined[li] = true;
         acc_leaf = rewrite_leaf_to_scratch(
@@ -1816,22 +1870,13 @@ fn execute_filter_cross(
         )?;
     }
 
-    // 6. Apply all filter predicates on final result
-    let final_leaf = rewrite_leaf_to_scratch(
-        &acc_leaf,
-        filter,
-        &joined,
-        &col_to_leaf,
-        required_columns,
-        disk_client.clone(),
-        scratch,
-        memory_limit_mb,
-    )?;
-
+    // 6. Return accumulated result directly (rewrite already applied in the loop)
+    //    All predicates that reference only joined leaves have already been applied
+    //    by prior rewrite_leaf_to_scratch calls. Skip redundant final pass.
     Ok(Box::new(ScratchRunsSource::new(
-        final_leaf.columns,
-        final_leaf.schema,
-        final_leaf.runs,
+        acc_leaf.columns,
+        acc_leaf.schema,
+        acc_leaf.runs,
         disk_client,
     )))
 }
@@ -1948,7 +1993,7 @@ fn grace_hash_join(
     Ok(output)
 }
 
-/// Load all rows from a scratch run.
+/// Load all rows from a scratch run — batch-reads blocks for fewer I/O ops.
 fn load_scratch_run(
     run: &ScratchRunMeta,
     schema: &[DataType],
@@ -1956,10 +2001,16 @@ fn load_scratch_run(
     block_size: usize,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    for block_offset in 0..run.num_blocks {
-        let block_data = disk_client.borrow_mut()
-            .get_blocks(run.start_block + block_offset, 1)?;
-        rows.extend(decode_scratch_block(&block_data, schema)?);
+    let mut block_offset = 0u64;
+    while block_offset < run.num_blocks {
+        let remaining = run.num_blocks - block_offset;
+        let fetch_count = remaining.min(SCRATCH_PREFETCH_BLOCKS);
+        let batch_data = disk_client.borrow_mut()
+            .get_blocks(run.start_block + block_offset, fetch_count)?;
+        block_offset += fetch_count;
+        for block in batch_data.chunks_exact(block_size) {
+            rows.extend(decode_scratch_block(block, schema)?);
+        }
     }
     Ok(rows)
 }
@@ -1994,9 +2045,9 @@ fn materialize_filtered_source_to_scratch(
 ) -> Result<MaterializedLeaf> {
     let columns = source.columns().to_vec();
     let schema: Vec<DataType> = columns.iter().map(|column| column.data_type.clone()).collect();
-    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 8) as usize)
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 4) as usize)
         / scratch_row_size_estimate(&schema))
-        .clamp(256, 4096);
+        .clamp(256, 32768);
 
     let mut runs = Vec::new();
     let mut row_count = 0usize;
@@ -2088,7 +2139,7 @@ fn partition_source_to_scratch(
     disk_client: SharedDiskClient,
     scratch: &mut ScratchAllocator,
 ) -> Result<Vec<Vec<ScratchRunMeta>>> {
-    const WRITE_BUF: usize = 128;
+    const WRITE_BUF: usize = SCRATCH_WRITE_BUF;
 
     let mut bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let mut runs: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
@@ -2157,18 +2208,48 @@ fn join_leaves_to_scratch(
     let block_size = disk_client.borrow().block_size;
     let mut runs = Vec::new();
     let mut row_count = 0usize;
-    let mut out_buf: Vec<Row> = Vec::with_capacity(128);
+    let mut out_buf: Vec<Row> = Vec::with_capacity(SCRATCH_WRITE_BUF);
 
     for p in 0..num_partitions {
-        let right_part =
-            load_scratch_runs(&right_parts[p], &right_leaf.schema, disk_client.clone(), block_size)?;
-        if right_part.is_empty() {
+        if right_parts[p].is_empty() || left_parts[p].is_empty() {
+            continue;
+        }
+        
+        let right_part_bytes: usize = right_parts[p].iter().map(|m| m.num_blocks as usize * block_size).sum();
+        
+        // Handle Skew: If Grace hash partition collision exceeds memory limits
+        if right_part_bytes > budget_bytes {
+            let mut left_src = ScratchRunsSource::new(
+                left_leaf.columns.clone(),
+                left_leaf.schema.clone(),
+                left_parts[p].clone(),
+                disk_client.clone(),
+            );
+            while let Some(left_row) = left_src.next_row()? {
+                let mut right_src = ScratchRunsSource::new(
+                    right_leaf.columns.clone(),
+                    right_leaf.schema.clone(),
+                    right_parts[p].clone(),
+                    disk_client.clone(),
+                );
+                while let Some(right_row) = right_src.next_row()? {
+                    if left_row.values[left_key] == right_row.values[right_key] {
+                        let mut values = left_row.values.clone();
+                        values.extend_from_slice(&right_row.values);
+                        out_buf.push(Row { values });
+                        row_count += 1;
+                        if out_buf.len() >= SCRATCH_WRITE_BUF {
+                            runs.push(write_run_to_scratch(&out_buf, &output_schema, disk_client.clone(), scratch)?);
+                            out_buf.clear();
+                        }
+                    }
+                }
+            }
             continue;
         }
 
-        if left_parts[p].is_empty() {
-            continue;
-        }
+        let right_part =
+            load_scratch_runs(&right_parts[p], &right_leaf.schema, disk_client.clone(), block_size)?;
 
         let mut ht: HashMap<DataKey, Vec<&Row>> = HashMap::new();
         for row in &right_part {
@@ -2193,7 +2274,7 @@ fn join_leaves_to_scratch(
                     out_buf.push(Row { values });
                     row_count += 1;
 
-                    if out_buf.len() >= 128 {
+                    if out_buf.len() >= SCRATCH_WRITE_BUF {
                         runs.push(write_run_to_scratch(
                             &out_buf,
                             &output_schema,
@@ -2249,9 +2330,9 @@ fn rewrite_leaf_to_scratch(
         .iter()
         .map(|column| column.data_type.clone())
         .collect();
-    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 8) as usize)
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 4) as usize)
         / scratch_row_size_estimate(&schema))
-        .clamp(256, 4096);
+        .clamp(256, 32768);
     let current_col_idx = build_column_index(&leaf.columns);
 
     let mut source = make_leaf_source(leaf, disk_client.clone());
@@ -2389,7 +2470,7 @@ fn streaming_grace_hash_join(
     // ------------------------------------------------------------------
     // Stream right source into scratch partitions (write buffer per part)
     // ------------------------------------------------------------------
-    const WRITE_BUF: usize = 128; // rows per partition before flushing to scratch
+    const WRITE_BUF: usize = SCRATCH_WRITE_BUF; // rows per partition before flushing to scratch
     let mut right_bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let mut right_run_parts: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
 
@@ -2581,9 +2662,9 @@ fn execute_query_op(
             external_sort(sort, child, disk_client, scratch, memory_limit_mb)
         }
         QueryOp::Cross(cross) => {
-            let left = materialize_source(execute_query_op(&cross.left, ctx, disk_client.clone(), scratch, memory_limit_mb)?)?;      //APal
-            let right = materialize_source(execute_query_op(&cross.right, ctx, disk_client, scratch, memory_limit_mb)?)?;            //APal
-            Ok(Box::new(MaterializedSource::new(execute_cross(left, right))))
+            let left = execute_query_op(&cross.left, ctx, disk_client.clone(), scratch, memory_limit_mb)?;
+            let right = execute_query_op(&cross.right, ctx, disk_client.clone(), scratch, memory_limit_mb)?;
+            out_of_core_cross(left, right, disk_client, scratch, memory_limit_mb)
         }
     }
 }
@@ -2594,8 +2675,9 @@ fn write_result_to_monitor(
 ) -> Result<()> {
     monitor_out.write_all(b"validate\n")?;
 
+    let mut line = String::with_capacity(512);
     while let Some(row) = result_source.next_row()? {
-        let mut line = String::new();
+        line.clear();
         for value in &row.values {
             line.push_str(&data_to_output(value));
             line.push('|');
