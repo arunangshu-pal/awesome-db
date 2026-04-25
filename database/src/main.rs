@@ -1910,8 +1910,9 @@ fn grace_hash_join(
     scratch: &mut ScratchAllocator,
     memory_limit_mb: u64,
 ) -> Result<Vec<Row>> {
-    // Budget = 1/3 of memory limit for the build-side hash table of one partition.
-    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
+    // Budget = 1/4 of memory limit for the build-side hash table of one partition.
+    // (1/4 instead of 1/3 to handle 1.5x larger server data safely)
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 4) as usize;
 
     // Estimate right (build) side memory.
     // Simple heuristic: count bytes in encoded form (8 bytes per numeric, string len).
@@ -2176,7 +2177,7 @@ fn join_leaves_to_scratch(
     scratch: &mut ScratchAllocator,
     memory_limit_mb: u64,
 ) -> Result<MaterializedLeaf> {
-    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 4) as usize;
     let right_est = right_leaf.row_count
         .saturating_mul(scratch_row_size_estimate(&right_leaf.schema));
     let num_partitions = if right_est <= budget_bytes {
@@ -2426,8 +2427,8 @@ fn streaming_grace_hash_join(
     scratch: &mut ScratchAllocator,
     memory_limit_mb: u64,
 ) -> Result<Vec<Row>> {
-    // Budget = 1/3 of memory limit for a single partition's hash table.
-    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 3) as usize;
+    // Budget = 1/4 of memory limit for a single partition's hash table.
+    let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 4) as usize;
 
     // Decide partition count based on a rough right-side size estimate.
     // We peek at up to 1024 rows to estimate avg row size, keeping them buffered.
