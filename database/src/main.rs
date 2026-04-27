@@ -12,6 +12,7 @@ use std::{
     cell::RefCell,
     cmp::Ordering,
     collections::{BinaryHeap, HashMap, HashSet},
+    fmt::Write as _,
     hash::{Hash, Hasher},
     io::{BufRead, BufReader, BufWriter, Read, Write},
     rc::Rc,
@@ -51,8 +52,8 @@ trait RowSource {
 
 type SharedDiskClient = Rc<RefCell<DiskClient>>;
 const SCAN_BATCH_BLOCKS: u64 = 128;
-const SCRATCH_PREFETCH_BLOCKS: u64 = 32;
-const SCRATCH_WRITE_BUF: usize = 2048;
+const SCRATCH_STREAM_PREFETCH_BLOCKS: u64 = 12;
+const SCRATCH_WRITE_BUF: usize = 512;
 
 struct DiskClient {
     reader: BufReader<Box<dyn Read>>,
@@ -224,12 +225,13 @@ fn decode_scratch_value(dtype: &DataType, buf: &[u8], offset: &mut usize) -> Res
 fn encode_rows_to_scratch_blocks(rows: &[Row], _schema: &[DataType], block_size: usize) -> Vec<u8> {
     let mut all = Vec::new();
     let mut block = vec![0u8; block_size];
+    let mut rbuf = Vec::with_capacity(block_size.saturating_sub(2));
     let mut offset = 0usize;
     let mut count = 0u16;
 
     for row in rows {
-        // Encode the row into a temporary buffer
-        let mut rbuf = Vec::new();
+        // Reuse the temporary row buffer across rows to avoid repeated allocations.
+        rbuf.clear();
         for val in &row.values {
             encode_scratch_value(val, &mut rbuf);
         }
@@ -243,7 +245,7 @@ fn encode_rows_to_scratch_blocks(rows: &[Row], _schema: &[DataType], block_size:
             block[block_size - 2] = cb[0];
             block[block_size - 1] = cb[1];
             all.extend_from_slice(&block);
-            block = vec![0u8; block_size];
+            block.fill(0);
             offset = 0;
             count = 0;
         }
@@ -346,6 +348,7 @@ struct MergeSortSource {
     run_states: Vec<RunState>,
     disk_client: SharedDiskClient,
     block_size: usize,
+    prefetch_blocks: u64,
     heap: BinaryHeap<std::cmp::Reverse<HeapEntry>>,
 }
 
@@ -359,6 +362,14 @@ impl MergeSortSource {
         disk_client: SharedDiskClient,
         block_size: usize,
     ) -> Result<Self> {
+        // Adaptive prefetch: with K runs, each run's rows_buffer holds decoded rows
+        // from prefetch_blocks blocks. Total memory ≈ K × prefetch × rows_per_block × row_size.
+        // Keep this under ~16MB to leave room for other allocations within 64MB.
+        let prefetch_blocks: u64 = if runs.len() <= 16 { 16 }
+                                   else if runs.len() <= 40 { 8 }
+                                   else if runs.len() <= 80 { 4 }
+                                   else { 2 };
+
         let mut run_states: Vec<RunState> = runs.iter().map(|_| RunState {
             block_offset: 0,
             rows_buffer: Vec::new(),
@@ -367,8 +378,8 @@ impl MergeSortSource {
 
         let mut heap = BinaryHeap::new();
         for run_idx in 0..runs.len() {
-            if let Some(row) = Self::pull_next(
-                run_idx, &runs, &mut run_states[run_idx], &schema, &disk_client, block_size,
+            if let Some(row) = Self::pull_next_with_prefetch(
+                run_idx, &runs, &mut run_states[run_idx], &schema, &disk_client, block_size, prefetch_blocks,
             )? {
                 let key_values: Vec<Data> = sort_col_indices.iter()
                     .map(|&i| row.values[i].clone()).collect();
@@ -379,16 +390,17 @@ impl MergeSortSource {
         }
 
         Ok(Self { columns, schema, sort_col_indices, ascending, runs, run_states,
-                  disk_client, block_size, heap })
+                  disk_client, block_size, prefetch_blocks, heap })
     }
 
-    fn pull_next(
+    fn pull_next_with_prefetch(
         run_idx: usize,
         runs: &[ScratchRunMeta],
         state: &mut RunState,
         schema: &[DataType],
         disk_client: &SharedDiskClient,
         block_size: usize,
+        prefetch_blocks: u64,
     ) -> Result<Option<Row>> {
         if state.row_idx < state.rows_buffer.len() {
             let row = state.rows_buffer[state.row_idx].clone();
@@ -399,7 +411,7 @@ impl MergeSortSource {
         if state.block_offset >= run.num_blocks { return Ok(None); }
         // Batch-prefetch multiple blocks at once to reduce rotational latency
         let remaining = run.num_blocks - state.block_offset;
-        let fetch_count = remaining.min(SCRATCH_PREFETCH_BLOCKS);
+        let fetch_count = remaining.min(prefetch_blocks);
         let batch_data = disk_client.borrow_mut()
             .get_blocks(run.start_block + state.block_offset, fetch_count)?;
         state.block_offset += fetch_count;
@@ -425,9 +437,9 @@ impl RowSource for MergeSortSource {
             return Ok(None);
         };
         let run_idx = entry.run_idx;
-        if let Some(next_row) = Self::pull_next(
+        if let Some(next_row) = Self::pull_next_with_prefetch(
             run_idx, &self.runs, &mut self.run_states[run_idx],
-            &self.schema, &self.disk_client, self.block_size,
+            &self.schema, &self.disk_client, self.block_size, self.prefetch_blocks,
         )? {
             let key_values: Vec<Data> = self.sort_col_indices.iter()
                 .map(|&i| next_row.values[i].clone()).collect();
@@ -516,7 +528,7 @@ impl RowSource for ScratchRunsSource {
 
             // Batch-prefetch multiple blocks to reduce I/O operations
             let remaining = run.num_blocks - self.current_block_offset;
-            let fetch_count = remaining.min(SCRATCH_PREFETCH_BLOCKS);
+            let fetch_count = remaining.min(SCRATCH_STREAM_PREFETCH_BLOCKS);
             let batch = self
                 .disk_client
                 .borrow_mut()
@@ -648,22 +660,25 @@ impl RowSource for ScanSource {
 
 struct FilterSource {
     columns: Vec<ColumnMeta>,
-    predicates: Vec<Predicate>,
-    column_index: HashMap<String, usize>,
+    predicates: Vec<CompiledPredicate>,
     child: Box<dyn RowSource>,
 }
 
 impl FilterSource {
-    fn new(filter: &FilterData, child: Box<dyn RowSource>) -> Self {
+    fn new(filter: &FilterData, child: Box<dyn RowSource>) -> Result<Self> {
         let columns = child.columns().to_vec();
         let column_index = build_column_index(&columns);
+        let predicates = filter
+            .predicates
+            .iter()
+            .map(|predicate| compile_predicate(predicate, &column_index))
+            .collect::<Result<Vec<_>>>()?;
 
-        Self {
+        Ok(Self {
             columns,
-            predicates: filter.predicates.clone(),
-            column_index,
+            predicates,
             child,
-        }
+        })
     }
 }
 
@@ -677,7 +692,7 @@ impl RowSource for FilterSource {
             let mut keep_row = true;
 
             for predicate in &self.predicates {
-                if !predicate_matches(predicate, &row, &self.column_index)? {
+                if !compiled_predicate_matches(predicate, &row)? {
                     keep_row = false;
                     break;
                 }
@@ -1181,27 +1196,33 @@ fn compiled_predicate_matches(predicate: &CompiledPredicate, row: &Row) -> Resul
     Ok(compare_data(left, &predicate.operator, &right))
 }
 
-fn data_to_output(data: &Data) -> String {
+fn append_data_to_output(buf: &mut String, data: &Data) {
     match data {
-        Data::Int32(value) => value.to_string(),
-        Data::Int64(value) => value.to_string(),
+        Data::Int32(value) => {
+            let _ = write!(buf, "{}", value);
+        }
+        Data::Int64(value) => {
+            let _ = write!(buf, "{}", value);
+        }
         Data::Float32(value) => {
             let s = value.to_string();
             if s.contains('.') || s.contains('e') || s.contains('E') {
-                s
+                buf.push_str(&s);
             } else {
-                format!("{}.0", s)
+                buf.push_str(&s);
+                buf.push_str(".0");
             }
         }
         Data::Float64(value) => {
             let s = value.to_string();
             if s.contains('.') || s.contains('e') || s.contains('E') {
-                s
+                buf.push_str(&s);
             } else {
-                format!("{}.0", s)
+                buf.push_str(&s);
+                buf.push_str(".0");
             }
         }
-        Data::String(value) => value.clone(),
+        Data::String(value) => buf.push_str(value),
     }
 }
 
@@ -1288,7 +1309,7 @@ fn write_project_filter_scan_fast(
                 if keep {
                     line.clear();
                     for project_column in &projection {
-                        line.push_str(&data_to_output(&row.values[project_column.source_idx]));
+                        append_data_to_output(&mut line, &row.values[project_column.source_idx]);
                         line.push('|');
                     }
                     line.push('\n');
@@ -1501,6 +1522,7 @@ fn external_sort(
 
     // Memory budget: use 1/2 of the limit for in-memory runs.
     // RLIMIT_AS includes stack, code, runtime overhead (~10-15MB), so be conservative.
+    // Larger runs = fewer merge runs = fewer non-sequential I/O ops during merge.
     let row_est = scratch_row_size_estimate(&schema);
     let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 2) as usize;
     let run_capacity = (budget_bytes / row_est).clamp(256, 16384);
@@ -1589,7 +1611,7 @@ fn execute_join_leaf(
                 let mut leaf_required = required_columns.cloned().unwrap_or_default();
                 collect_required_columns_for_filter(filter, &mut leaf_required);
                 let scan = ScanSource::new(table, disk_client, Some(&leaf_required))?;
-                return Ok(Box::new(FilterSource::new(filter, Box::new(scan))));
+                return Ok(Box::new(FilterSource::new(filter, Box::new(scan))?));
             }
             execute_query_op(query_op, ctx, disk_client, scratch, memory_limit_mb)
         }
@@ -1871,13 +1893,22 @@ fn execute_filter_cross(
         )?;
     }
 
-    // 6. Return accumulated result directly (rewrite already applied in the loop)
-    //    All predicates that reference only joined leaves have already been applied
-    //    by prior rewrite_leaf_to_scratch calls. Skip redundant final pass.
+    // 6. Apply all filter predicates on final result
+    let final_leaf = rewrite_leaf_to_scratch(
+        &acc_leaf,
+        filter,
+        &joined,
+        &col_to_leaf,
+        required_columns,
+        disk_client.clone(),
+        scratch,
+        memory_limit_mb,
+    )?;
+
     Ok(Box::new(ScratchRunsSource::new(
-        acc_leaf.columns,
-        acc_leaf.schema,
-        acc_leaf.runs,
+        final_leaf.columns,
+        final_leaf.schema,
+        final_leaf.runs,
         disk_client,
     )))
 }
@@ -2006,7 +2037,7 @@ fn load_scratch_run(
     let mut block_offset = 0u64;
     while block_offset < run.num_blocks {
         let remaining = run.num_blocks - block_offset;
-        let fetch_count = remaining.min(SCRATCH_PREFETCH_BLOCKS);
+        let fetch_count = remaining.min(SCRATCH_STREAM_PREFETCH_BLOCKS);
         let batch_data = disk_client.borrow_mut()
             .get_blocks(run.start_block + block_offset, fetch_count)?;
         block_offset += fetch_count;
@@ -2047,9 +2078,9 @@ fn materialize_filtered_source_to_scratch(
 ) -> Result<MaterializedLeaf> {
     let columns = source.columns().to_vec();
     let schema: Vec<DataType> = columns.iter().map(|column| column.data_type.clone()).collect();
-    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 4) as usize)
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 8) as usize)
         / scratch_row_size_estimate(&schema))
-        .clamp(256, 16384);
+        .clamp(256, 4096);
 
     let mut runs = Vec::new();
     let mut row_count = 0usize;
@@ -2141,7 +2172,9 @@ fn partition_source_to_scratch(
     disk_client: SharedDiskClient,
     scratch: &mut ScratchAllocator,
 ) -> Result<Vec<Vec<ScratchRunMeta>>> {
-    const WRITE_BUF: usize = SCRATCH_WRITE_BUF;
+    // Use larger partition buffers to reduce the number of flush operations.
+    // Each flush is a non-sequential write costing ~4ms rotational latency.
+    const WRITE_BUF: usize = 512;
 
     let mut bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let mut runs: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
@@ -2180,11 +2213,85 @@ fn join_leaves_to_scratch(
     let budget_bytes = ((memory_limit_mb * 1024 * 1024) / 4) as usize;
     let right_est = right_leaf.row_count
         .saturating_mul(scratch_row_size_estimate(&right_leaf.schema));
-    let num_partitions = if right_est <= budget_bytes {
-        1usize
-    } else {
-        ((right_est / budget_bytes) + 1).max(2).min(256)
-    };
+    let output_schema: Vec<DataType> = output_columns
+        .iter()
+        .map(|column| column.data_type.clone())
+        .collect();
+    let block_size = disk_client.borrow().block_size;
+
+    if right_est <= budget_bytes {
+        if left_leaf.row_count == 0 || right_leaf.row_count == 0 {
+            return Ok(MaterializedLeaf {
+                columns: output_columns,
+                schema: output_schema,
+                runs: Vec::new(),
+                row_count: 0,
+            });
+        }
+
+        let mut runs = Vec::new();
+        let mut row_count = 0usize;
+        let mut out_buf: Vec<Row> = Vec::with_capacity(SCRATCH_WRITE_BUF);
+        let right_part =
+            load_scratch_runs(&right_leaf.runs, &right_leaf.schema, disk_client.clone(), block_size)?;
+        if right_part.is_empty() {
+            return Ok(MaterializedLeaf {
+                columns: output_columns,
+                schema: output_schema,
+                runs: Vec::new(),
+                row_count: 0,
+            });
+        }
+
+        let mut ht: HashMap<DataKey, Vec<&Row>> = HashMap::new();
+        for row in &right_part {
+            ht.entry(DataKey(row.values[right_key].clone()))
+                .or_default()
+                .push(row);
+        }
+
+        let mut left_src = make_leaf_source(left_leaf, disk_client.clone());
+
+        while let Some(left_row) = left_src.next_row()? {
+            let key = DataKey(left_row.values[left_key].clone());
+            if let Some(matches) = ht.get(&key) {
+                for right_row in matches {
+                    let mut values = left_row.values.clone();
+                    values.extend_from_slice(&right_row.values);
+                    out_buf.push(Row { values });
+                    row_count += 1;
+
+                    if out_buf.len() >= SCRATCH_WRITE_BUF {
+                        runs.push(write_run_to_scratch(
+                            &out_buf,
+                            &output_schema,
+                            disk_client.clone(),
+                            scratch,
+                        )?);
+                        out_buf.clear();
+                    }
+                }
+            }
+        }
+
+        if !out_buf.is_empty() {
+            runs.push(write_run_to_scratch(
+                &out_buf,
+                &output_schema,
+                disk_client,
+                scratch,
+            )?);
+        }
+
+        return Ok(MaterializedLeaf {
+            columns: output_columns,
+            schema: output_schema,
+            runs,
+            row_count,
+        });
+    }
+
+    let num_partitions = ((right_est / budget_bytes) + 1).max(2).min(256);
 
     let left_parts = partition_source_to_scratch(
         make_leaf_source(left_leaf, disk_client.clone()),
@@ -2203,11 +2310,6 @@ fn join_leaves_to_scratch(
         scratch,
     )?;
 
-    let output_schema: Vec<DataType> = output_columns
-        .iter()
-        .map(|column| column.data_type.clone())
-        .collect();
-    let block_size = disk_client.borrow().block_size;
     let mut runs = Vec::new();
     let mut row_count = 0usize;
     let mut out_buf: Vec<Row> = Vec::with_capacity(SCRATCH_WRITE_BUF);
@@ -2216,9 +2318,12 @@ fn join_leaves_to_scratch(
         if right_parts[p].is_empty() || left_parts[p].is_empty() {
             continue;
         }
-        
-        let right_part_bytes: usize = right_parts[p].iter().map(|m| m.num_blocks as usize * block_size).sum();
-        
+
+        let right_part_bytes: usize = right_parts[p]
+            .iter()
+            .map(|m| m.num_blocks as usize * block_size)
+            .sum();
+
         // Handle Skew: If Grace hash partition collision exceeds memory limits
         if right_part_bytes > budget_bytes {
             let mut left_src = ScratchRunsSource::new(
@@ -2332,10 +2437,20 @@ fn rewrite_leaf_to_scratch(
         .iter()
         .map(|column| column.data_type.clone())
         .collect();
-    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 4) as usize)
-        / scratch_row_size_estimate(&schema))
-        .clamp(256, 16384);
+
+    // Skip no-op rewrite: if all columns are kept and no filter predicates are
+    // applicable, the rewrite would just copy every row unchanged — avoid the I/O.
     let current_col_idx = build_column_index(&leaf.columns);
+    let has_applicable_filters = filter.predicates.iter().any(|p| 
+        predicate_is_ready(p, &current_col_idx)
+    );
+    if keep_indices.len() == leaf.columns.len() && !has_applicable_filters {
+        return Ok(leaf.clone());
+    }
+
+    let row_capacity = ((((memory_limit_mb * 1024 * 1024) / 8) as usize)
+        / scratch_row_size_estimate(&schema))
+        .clamp(256, 4096);
 
     let mut source = make_leaf_source(leaf, disk_client.clone());
     let mut runs = Vec::new();
@@ -2470,29 +2585,21 @@ fn streaming_grace_hash_join(
     let block_size = disk_client.borrow().block_size;
 
     // ------------------------------------------------------------------
-    // Stream right source into scratch partitions (write buffer per part)
+    // Stream right source into scratch partitions with larger buffers
+    // to reduce the number of non-sequential flush operations.
     // ------------------------------------------------------------------
-    const WRITE_BUF: usize = SCRATCH_WRITE_BUF; // rows per partition before flushing to scratch
+    const WRITE_BUF: usize = 512;
     let mut right_bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let mut right_run_parts: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
-
-    // Helper: flush one partition buffer to scratch
-    let flush_partition = |p: usize, bufs: &mut Vec<Vec<Row>>, run_parts: &mut Vec<Vec<ScratchRunMeta>>,
-                           disk_client: &SharedDiskClient, scratch: &mut ScratchAllocator,
-                           schema: &[DataType]| -> Result<()> {
-        if bufs[p].is_empty() { return Ok(()); }
-        let meta = write_run_to_scratch(&bufs[p], schema, disk_client.clone(), scratch)?;
-        run_parts[p].push(meta);
-        bufs[p].clear();
-        Ok(())
-    };
 
     // Process the already-sampled rows
     for row in sample {
         let p = partition_of(&row.values[right_key], num_partitions);
         right_bufs[p].push(row);
         if right_bufs[p].len() >= WRITE_BUF {
-            flush_partition(p, &mut right_bufs, &mut right_run_parts, &disk_client, scratch, right_schema)?;
+            let meta = write_run_to_scratch(&right_bufs[p], right_schema, disk_client.clone(), scratch)?;
+            right_run_parts[p].push(meta);
+            right_bufs[p].clear();
         }
     }
 
@@ -2504,17 +2611,23 @@ fn streaming_grace_hash_join(
         let p = partition_of(&row.values[right_key], num_partitions);
         right_bufs[p].push(row);
         if right_bufs[p].len() >= WRITE_BUF {
-            flush_partition(p, &mut right_bufs, &mut right_run_parts, &disk_client, scratch, right_schema)?;
+            let meta = write_run_to_scratch(&right_bufs[p], right_schema, disk_client.clone(), scratch)?;
+            right_run_parts[p].push(meta);
+            right_bufs[p].clear();
         }
     }
     // Flush remaining buffers
     for p in 0..num_partitions {
-        flush_partition(p, &mut right_bufs, &mut right_run_parts, &disk_client, scratch, right_schema)?;
+        if !right_bufs[p].is_empty() {
+            let meta = write_run_to_scratch(&right_bufs[p], right_schema, disk_client.clone(), scratch)?;
+            right_run_parts[p].push(meta);
+            right_bufs[p].clear();
+        }
     }
     drop(right_bufs);
 
     // ------------------------------------------------------------------
-    // Partition left side the same way
+    // Partition left side with same larger buffers
     // ------------------------------------------------------------------
     let mut left_bufs: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let mut left_run_parts: Vec<Vec<ScratchRunMeta>> = (0..num_partitions).map(|_| Vec::new()).collect();
@@ -2586,7 +2699,7 @@ fn execute_query_op(
                 );
             }
             let child = execute_query_op(&filter.underlying, ctx, disk_client, scratch, memory_limit_mb)?;
-            Ok(Box::new(FilterSource::new(filter, child)))
+            Ok(Box::new(FilterSource::new(filter, child)?))
         }
         QueryOp::Project(project) => {
             if let QueryOp::Filter(filter) = project.underlying.as_ref() {
@@ -2638,7 +2751,7 @@ fn execute_query_op(
                         collect_required_columns_for_sort(sort, &mut required_columns);
                         collect_required_columns_for_filter(filter, &mut required_columns);
                         let scan = ScanSource::new(table, disk_client.clone(), Some(&required_columns))?;
-                        let filtered: Box<dyn RowSource> = Box::new(FilterSource::new(filter, Box::new(scan)));
+                        let filtered: Box<dyn RowSource> = Box::new(FilterSource::new(filter, Box::new(scan))?);
                         let sorted = external_sort(sort, filtered, disk_client, scratch, memory_limit_mb)?;
                         return Ok(Box::new(ProjectSource::new(project, sorted)?));
                     }
@@ -2698,7 +2811,7 @@ fn execute_query_op(
                     collect_required_columns_for_sort(sort, &mut required_columns);
                     collect_required_columns_for_filter(filter, &mut required_columns);
                     let scan = ScanSource::new(table, disk_client.clone(), Some(&required_columns))?;
-                    let filtered: Box<dyn RowSource> = Box::new(FilterSource::new(filter, Box::new(scan)));
+                    let filtered: Box<dyn RowSource> = Box::new(FilterSource::new(filter, Box::new(scan))?);
                     return external_sort(sort, filtered, disk_client, scratch, memory_limit_mb);
                 }
             }
@@ -2731,7 +2844,7 @@ fn write_result_to_monitor(
     while let Some(row) = result_source.next_row()? {
         line.clear();
         for value in &row.values {
-            line.push_str(&data_to_output(value));
+            append_data_to_output(&mut line, value);
             line.push('|');
         }
         line.push('\n');
